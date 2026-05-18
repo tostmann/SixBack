@@ -10,11 +10,46 @@ namespace {
 constexpr const char* NVS_NS  = "bosefix-pre";
 constexpr const char* NVS_KEY = "presets";
 
+// Escaped fuer XML-Text-Inhalt UND fuer doppelt-gequotete Attribute-Werte.
+// Beide Kontexte brauchen mind. & und < entkommen; im Attribut zusaetzlich ".
+// Stations-Namen wie "Radio Bob & Friends" oder Stream-URLs mit Query-Parametern
+// die '&' enthalten produzierten vorher ungueltiges XML — Speaker lehnt dann
+// den /account/full-Sync ab, Presets bleiben leer am Geraet.
+String xmlEscape_(const String& in) {
+    String out;
+    out.reserve(in.length() + 8);
+    for (size_t i = 0; i < in.length(); ++i) {
+        char c = in.charAt(i);
+        switch (c) {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default:   out += c;        break;
+        }
+    }
+    return out;
+}
+
 } // anon
 
 PresetStore& PresetStore::instance() {
     static PresetStore s;
     return s;
+}
+
+void PresetStore::initMutex_() {
+    if (!mx_) mx_ = xSemaphoreCreateRecursiveMutex();
+}
+
+PresetStore::LockGuard::LockGuard(PresetStore& ps) : ps_(ps) {
+    ps_.initMutex_();
+    xSemaphoreTakeRecursive(ps_.mx_, portMAX_DELAY);
+}
+
+PresetStore::LockGuard::~LockGuard() {
+    xSemaphoreGiveRecursive(ps_.mx_);
 }
 
 const char* presetSourceToStr(PresetSource s) {
@@ -32,6 +67,7 @@ PresetSource presetSourceFromStr(const String& s) {
 }
 
 void PresetStore::loadFromNVS() {
+    LockGuard g(*this);
     JsonDocument doc;
     if (!nvsLoadJson(NVS_NS, NVS_KEY, doc)) return;
     speakers_.clear();
@@ -62,6 +98,7 @@ void PresetStore::loadFromNVS() {
 }
 
 void PresetStore::saveToNVS() {
+    LockGuard g(*this);
     JsonDocument doc;
     JsonArray arr = doc["speakers"].to<JsonArray>();
     for (auto& s : speakers_) {
@@ -103,6 +140,7 @@ PresetStore::PerSpeaker* PresetStore::find_(const String& deviceId) {
 }
 
 std::vector<Preset> PresetStore::getForSpeaker(const String& deviceId) {
+    LockGuard g(*this);
     std::vector<Preset> out;
     auto* s = find_(deviceId);
     for (int i = 0; i < 6; ++i) {
@@ -121,6 +159,7 @@ std::vector<Preset> PresetStore::getForSpeaker(const String& deviceId) {
 }
 
 Preset PresetStore::get(const String& deviceId, uint8_t slot) {
+    LockGuard g(*this);
     Preset p; p.slot = slot; p.source = PresetSource::EMPTY;
     if (slot < 1 || slot > 6) return p;
     auto* s = find_(deviceId);
@@ -129,6 +168,7 @@ Preset PresetStore::get(const String& deviceId, uint8_t slot) {
 }
 
 bool PresetStore::set(const String& deviceId, const Preset& p) {
+    LockGuard g(*this);
     if (p.slot < 1 || p.slot > 6) return false;
     auto* s = findOrCreate_(deviceId);
     s->slots[p.slot - 1] = p;
@@ -136,7 +176,23 @@ bool PresetStore::set(const String& deviceId, const Preset& p) {
     return true;
 }
 
+bool PresetStore::setSlots(const String& deviceId, const std::vector<Preset>& presets) {
+    if (presets.empty()) return false;
+    LockGuard g(*this);
+    auto* s = findOrCreate_(deviceId);
+    bool changed = false;
+    for (const auto& p : presets) {
+        if (p.slot < 1 || p.slot > 6) continue;
+        s->slots[p.slot - 1]      = p;
+        s->slots[p.slot - 1].slot = p.slot;  // defensiv re-stamp slot
+        changed = true;
+    }
+    if (changed) saveToNVS();
+    return changed;
+}
+
 bool PresetStore::clear(const String& deviceId, uint8_t slot) {
+    LockGuard g(*this);
     if (slot < 1 || slot > 6) return false;
     auto* s = find_(deviceId);
     if (!s) return false;
@@ -150,6 +206,7 @@ bool PresetStore::clear(const String& deviceId, uint8_t slot) {
 
 int PresetStore::syncToGroup(const String& sourceDeviceId,
                               const std::vector<String>& targetDeviceIds) {
+    LockGuard g(*this);
     auto* src = find_(sourceDeviceId);
     if (!src) return 0;
     int n = 0;
@@ -167,6 +224,7 @@ int PresetStore::syncToGroup(const String& sourceDeviceId,
 }
 
 void PresetStore::exportJson(JsonDocument& out) {
+    LockGuard g(*this);
     JsonArray arr = out["speakers"].to<JsonArray>();
     for (auto& s : speakers_) {
         JsonObject ps = arr.add<JsonObject>();
@@ -186,6 +244,7 @@ void PresetStore::exportJson(JsonDocument& out) {
 }
 
 bool PresetStore::importJson(JsonDocument& in) {
+    LockGuard g(*this);
     speakers_.clear();
     for (JsonObject ps : in["speakers"].as<JsonArray>()) {
         PerSpeaker s;
@@ -207,7 +266,23 @@ bool PresetStore::importJson(JsonDocument& in) {
     return true;
 }
 
+bool PresetStore::findByStationId(const String& stationId, Preset& out) {
+    LockGuard g(*this);
+    for (auto& s : speakers_) {
+        for (int i = 0; i < 6; ++i) {
+            const Preset& p = s.slots[i];
+            if (p.source == PresetSource::EMPTY) continue;
+            if (p.stationId == stationId) {
+                out = p;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 String PresetStore::toBoseXml(const String& deviceId) {
+    LockGuard g(*this);
     // Format aus Pre-Migration-Snapshot der Bose Cloud:
     //   <presets><preset id="N"><ContentItem source="TUNEIN" type="stationurl"
     //   location="/v1/playback/station/sXXXXX" sourceAccount="" isPresetable="true">
@@ -221,20 +296,20 @@ String PresetStore::toBoseXml(const String& deviceId) {
             out += "<preset id=\"";
             out += String(p.slot);
             out += "\"><ContentItem source=\"";
-            out += presetSourceToStr(p.source);
+            out += presetSourceToStr(p.source);  // enum-Konst — safe ohne Escape
             out += "\" type=\"stationurl\" location=\"";
             if (p.source == PresetSource::TUNEIN) {
                 out += "/v1/playback/station/";
-                out += p.stationId;
+                out += xmlEscape_(p.stationId);
             } else {
-                out += p.streamUrl;
+                out += xmlEscape_(p.streamUrl);
             }
             out += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>";
-            out += p.name;
+            out += xmlEscape_(p.name);
             out += "</itemName>";
             if (p.imageUrl.length() > 0) {
                 out += "<containerArt>";
-                out += p.imageUrl;
+                out += xmlEscape_(p.imageUrl);
                 out += "</containerArt>";
             }
             out += "</ContentItem></preset>";

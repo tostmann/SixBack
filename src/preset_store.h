@@ -16,6 +16,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 namespace bosefix {
 
@@ -38,6 +40,18 @@ class PresetStore {
 public:
     static PresetStore& instance();
 
+    // RAII-Lock fuer Caller die ueber mehrere Aufrufe konsistente Sicht
+    // brauchen. Rekursiv. Innen-Methoden locken sich ohnehin selbst.
+    class LockGuard {
+    public:
+        explicit LockGuard(PresetStore& ps);
+        ~LockGuard();
+        LockGuard(const LockGuard&) = delete;
+        LockGuard& operator=(const LockGuard&) = delete;
+    private:
+        PresetStore& ps_;
+    };
+
     void loadFromNVS();
     void saveToNVS();
 
@@ -45,8 +59,12 @@ public:
     std::vector<Preset> getForSpeaker(const String& deviceId);
     // Lese Preset fuer einen Slot (1..6).
     Preset get(const String& deviceId, uint8_t slot);
-    // Setze ein Preset (slot 1..6). Persistiert.
+    // Setze ein Preset (slot 1..6). Persistiert (1 NVS-Write).
     bool   set(const String& deviceId, const Preset& p);
+    // Setze N Presets fuer einen Speaker in einem Schwung — 1 NVS-Write
+    // statt N. Wird vom importFromDevice-Pfad genutzt, sonst sind das
+    // 6 Slots × ein write pro Speaker.
+    bool   setSlots(const String& deviceId, const std::vector<Preset>& presets);
     // Leeren Slot setzen (delete).
     bool   clear(const String& deviceId, uint8_t slot);
 
@@ -63,6 +81,12 @@ public:
     // im Bose-XML-Format - alle Slots fuer den deviceId.
     String toBoseXml(const String& deviceId);
 
+    // Hot-Path-Lookup fuer TuneIn-Resolve: iteriert alle Speaker × 6 Slots
+    // und liefert das erste Preset mit stationId==id zurueck. Vermeidet
+    // exportJson()-Builds, die bei jedem Preset-Druck am Speaker getriggert
+    // werden.  Liefert true wenn gefunden + befuellt out.
+    bool findByStationId(const String& stationId, Preset& out);
+
 private:
     PresetStore() = default;
 
@@ -76,6 +100,9 @@ private:
 
     PerSpeaker* findOrCreate_(const String& deviceId);
     PerSpeaker* find_(const String& deviceId);
+    void initMutex_();
+
+    mutable SemaphoreHandle_t mx_ = nullptr;
 };
 
 const char* presetSourceToStr(PresetSource s);

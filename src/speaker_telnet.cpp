@@ -27,14 +27,38 @@ static bool sendAndExpectOK(WiFiClient& client, const String& cmd,
             char c = client.read();
             reply += c;
             if (reply.endsWith("->")) {
-                // Bose-Prompt — Antwort komplett.
-                return reply.indexOf("OK") >= 0 ||
-                       reply.indexOf("Setting") >= 0;
+                // Bose-Prompt — Antwort komplett. Negative Marker
+                // ueberstimmen alles andere: "Setting 'foo' not found" matchte
+                // vorher faelschlich "Setting" als success.
+                if (reply.indexOf("not found") >= 0 ||
+                    reply.indexOf("Usage:")    >= 0 ||
+                    reply.indexOf("usage:")    >= 0 ||
+                    reply.indexOf("Error")     >= 0 ||
+                    reply.indexOf("Invalid")   >= 0 ||
+                    reply.indexOf("syntax")    >= 0) {
+                    return false;
+                }
+                return true;
             }
         }
         delay(20);
     }
     return false;
+}
+
+// Liest aus einem getpdo-CurrentSystemConfiguration-Reply den Wert eines
+// PDO-Felds ('text: "..."' nach dem Feldnamen) heraus. Liefert "" wenn
+// nichts gefunden wurde — passt auch zum getpdo-quirk wo manche Felder
+// kurzzeitig fehlen.
+static String extractPdoField_(const String& reply, const String& field) {
+    int p = reply.indexOf(field);
+    if (p < 0) return "";
+    int t = reply.indexOf("text:", p);
+    if (t < 0) return "";
+    int q1 = reply.indexOf('"', t);
+    int q2 = (q1 >= 0) ? reply.indexOf('"', q1 + 1) : -1;
+    if (q1 < 0 || q2 <= q1) return "";
+    return reply.substring(q1 + 1, q2);
 }
 
 MigrationResult migrateSpeaker(const String& speakerIP,
@@ -69,13 +93,23 @@ MigrationResult migrateSpeaker(const String& speakerIP,
         }
     }
 
-    // Verifikation (best-effort - alle 5 SET-cmds haben OK geliefert, der
-    // getpdo-Reply ist aber zeitweise inkonsistent, weshalb ein
-    // strict-substring-check zu false-negatives fuehrt. Wir loggen den
-    // Reply zur Diagnose, brechen aber NICHT mehr ab wenn die URL fehlt
-    // -- der Auto-Claim in refreshMigrationStatus faengt das auf.)
+    // Verifikation: getpdo soll zeigen dass margeServerUrl jetzt auf unsere
+    // base zeigt. Falls Mismatch: NICHT fail-hard, weil getpdo zeitweise
+    // inkonsistent ist (Diag-Shell-Quirk, NVS-Cache-Latenz) — Auto-Claim/
+    // Release in refreshMigrationStatus reconcile't das beim naechsten Refresh.
+    // Aber: das Mismatch wird ins r.message geschrieben, damit der User im
+    // Reply-Toast sieht, dass die Verifikation nicht clean durchging.
+    delay(200);  // NVS-write am Speaker abklingen lassen
     if (sendAndExpectOK(client, "getpdo CurrentSystemConfiguration", reply)) {
         r.verifiedConfig = reply;
+        String actualMarge = extractPdoField_(reply, "margeServerUrl");
+        if (actualMarge.length() > 0 && actualMarge != serverBaseUrl) {
+            Serial.printf("[telnet] WARN getpdo margeServerUrl=%s expected=%s "
+                          "— auto-claim will reconcile next refresh\n",
+                          actualMarge.c_str(), serverBaseUrl.c_str());
+            r.message = String("WARN: getpdo margeServerUrl=") + actualMarge +
+                        " expected=" + serverBaseUrl + " (auto-claim will fix)";
+        }
     }
 
     // Reboot

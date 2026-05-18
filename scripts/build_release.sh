@@ -18,19 +18,21 @@ PIO_BUILD="/root/pio-build/bosefix32"
 OUT="$ROOT/webflasher"
 mkdir -p "$OUT"
 
-# Resolve version from version.txt + build_number.txt (single source of truth).
-VER_MAJMIN="$(cat "$ROOT/version.txt" | tr -d '[:space:]')"
-VER_BUILD="$(cat "$ROOT/build_number.txt" | tr -d '[:space:]')"
-VERSION="${VER_MAJMIN}.${VER_BUILD}"
+# --- 1) Compile all envs + their LittleFS images --------------------------
+# Pio's pre-build-hook (version_bump.py) bumpt build_number bei jedem
+# `pio run`-Aufruf — daher liest dieses Script die Version ERST NACH dem
+# letzten Bump (= nach buildfs). Sonst stuende im manifest.json ein
+# kleinerer Build als in den .bin-Dateien drin (frueher Bug, beobachtet
+# beim v0.4-Release).
+"$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6
+"$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6 -t buildfs
 
+# Resolve final version after all bumps (single source of truth in version.h).
+VERSION="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' "$ROOT/src/version.h" | tr -d '"')"
 echo ">>> BoseFix32 release build, version=$VERSION"
 
-# --- 1) Compile all envs + their LittleFS images --------------------------
-pio run -e esp32 -e s3 -e c3 -e c6
-pio run -e esp32 -e s3 -e c3 -e c6 -t buildfs
-
 # --- 2) Per-target merge into single factory image -----------------------
-ESPTOOL=( pio pkg exec --package "platformio/tool-esptoolpy" -- python -m esptool )
+ESPTOOL=( "$HOME/.platformio/penv/bin/pio" pkg exec --package "platformio/tool-esptoolpy" -- python -m esptool )
 
 merge_target() {
   local tgt="$1" chip="$2" fsize="$3" spiffs_off="$4" boot_off="$5"

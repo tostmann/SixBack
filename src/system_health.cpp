@@ -106,9 +106,14 @@ void doSelfReboot(const char* reason, uint32_t& counterField) {
 }
 
 // Single-Speaker self-ping (synchron, 800ms timeout - billig).
-void pingOneSpeaker(Speaker& s) {
+// Mutiert die Kopie `s`; statusChanged=true wenn der Caller nach dem Merge
+// saveToNVS aufrufen soll. saveToNVS wird hier NICHT mehr direkt gemacht —
+// sonst persistieren wir den vor-merge-Zustand mit stalen Feldern.
+void pingOneSpeaker(Speaker& s, bool& statusChanged) {
+    statusChanged = false;
     if (s.ip.length() == 0) return;
     HTTPClient http;
+    http.setReuse(false);
     http.setConnectTimeout(HEALTH_PING_TIMEOUT_MS);
     http.setTimeout(HEALTH_PING_TIMEOUT_MS);
     String url = "http://" + s.ip + ":" + String(BOSE_BMX_PORT) + "/info";
@@ -122,7 +127,7 @@ void pingOneSpeaker(Speaker& s) {
             // war offline, jetzt wieder da - status zurueck auf UNKNOWN damit
             // ein refresh-status den echten Stand holt
             s.status = MigrationStatus::UNKNOWN;
-            SpeakerInventory::instance().saveToNVS();
+            statusChanged = true;
         }
     } else {
         uint8_t& miss = pingMissForId(s.deviceId);
@@ -132,23 +137,28 @@ void pingOneSpeaker(Speaker& s) {
             Serial.printf("[health] speaker %s (%s) OFFLINE after %u misses\n",
                           s.deviceId.c_str(), s.ip.c_str(), miss);
             s.status = MigrationStatus::OFFLINE;
-            SpeakerInventory::instance().saveToNVS();
+            statusChanged = true;
         }
     }
 }
 
 void pingAllSpeakers() {
     auto& inv = SpeakerInventory::instance();
-    // Kopie + zurueck-mergen ueber findById (vermeidet const-cast Spielereien)
+    // Snapshot OHNE Lock fuer HTTP-IO, dann unter Lock zurueck-mergen +
+    // saveToNVS nur wenn sich tatsaechlich Status aenderte.
     auto snapshot = inv.list();
+    bool anyChange = false;
     for (auto& s : snapshot) {
-        pingOneSpeaker(s);
-        auto* live = inv.findById(s.deviceId);
-        if (live) {
+        bool changed = false;
+        pingOneSpeaker(s, changed);
+        SpeakerInventory::LockGuard g(inv);
+        if (auto* live = inv.findById(s.deviceId)) {
             live->lastSeenMs = s.lastSeenMs;
             live->status     = s.status;
         }
+        if (changed) anyChange = true;
     }
+    if (anyChange) inv.saveToNVS();
 }
 
 }  // namespace

@@ -14,6 +14,8 @@
 #include <Arduino.h>
 #include <atomic>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 namespace bosefix {
 
@@ -45,6 +47,21 @@ class SpeakerInventory {
 public:
     static SpeakerInventory& instance();
 
+    // RAII-Lock fuer externe Halter eines Speaker*-Pointers. Rekursiv —
+    // public-Methoden duerfen den Lock auch nesten. Pflicht fuer jeden
+    // Caller, der findById()/findByIp() ueber mehrere Operationen hinweg
+    // benutzt; sonst kann der zugrundeliegende vector reallocaten und der
+    // Pointer dangelt.
+    class LockGuard {
+    public:
+        explicit LockGuard(SpeakerInventory& inv);
+        ~LockGuard();
+        LockGuard(const LockGuard&) = delete;
+        LockGuard& operator=(const LockGuard&) = delete;
+    private:
+        SpeakerInventory& inv_;
+    };
+
     // Laedt persistierte Speaker aus NVS in den RAM-cache.
     void loadFromNVS();
 
@@ -73,8 +90,8 @@ public:
     // discover() weil keine IP-Scan-Phase.
     void refreshMigrationStatus();
 
-    // Liefert read-only-Kopie der Liste fuer UI/API.
-    std::vector<Speaker> list() const { return speakers_; }
+    // Liefert read-only-Kopie der Liste fuer UI/API. Lock intern.
+    std::vector<Speaker> list();
 
     // Manuelles Hinzufuegen per IP (z.B. wenn SSDP nichts liefert).
     bool addByIp(const String& ip);
@@ -103,7 +120,11 @@ private:
     void activeScan_();
     static void activeScanTask_(void* arg);  // FreeRTOS entry
 
+    void initMutex_();
+
     std::atomic<bool> scanRunning_{false};
+
+    mutable SemaphoreHandle_t mx_ = nullptr;
 
     std::vector<Speaker> speakers_;
 };

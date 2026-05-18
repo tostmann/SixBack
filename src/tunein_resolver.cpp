@@ -11,9 +11,20 @@ namespace bosefix {
 namespace {
 
 constexpr const char* NVS_NS = "bosefix-tune";
-constexpr uint32_t CACHE_TTL_S = 7 * 24 * 3600;
 
-// Fallback-Liste: nur fuer den Fall dass Internet weg ist.
+// NVS-Cache-Policy: einmal aufgeloest, ewig gueltig.
+// Ohne RTC haben wir keinen verlaesslichen Zeitbegriff (millis() resettet
+// bei jedem Boot, NTP-Anbindung ist optional). Daher: kein automatisches
+// Aging — Stale-Eintraege werden durch User-Reset/Re-Migration ersetzt.
+// Wenn ein Sender den Stream-URL wechselt, muss der User entweder Preset
+// neu setzen oder NVS-Namespace `bosefix-tune` per OTA-Reset loeschen.
+// TODO: optionaler `POST /api/tunein/cache/clear`-Endpoint waere nuetzlich.
+
+// Fallback-Liste fuer "Internet weg und Cache leer" (= ganz frischer Boot
+// ohne je gelaufenen TuneIn-Resolve). Stark DACH-biased — Dirks lokale
+// Senderauswahl. Fuer non-DE-Deployments koennen Nutzer ihre Presets
+// einfach per Web-UI mit konkreten Stream-URLs setzen (source=
+// LOCAL_INTERNET_RADIO), dann ist die Fallback-Liste nicht relevant.
 struct Fallback { const char* id; const char* name; const char* url; };
 const Fallback kFallback[] = {
     { "s24896",  "SWR3",               "http://liveradio.swr.de/tn2d2ac/swr3" },
@@ -28,11 +39,6 @@ const size_t kFallbackCount = sizeof(kFallback) / sizeof(kFallback[0]);
 bool lookupCache(const String& id, String& url, String& name, String& image) {
     JsonDocument doc;
     if (!nvsLoadJson(NVS_NS, id.c_str(), doc)) return false;
-    uint32_t ts = doc["ts"].as<uint32_t>();
-    uint32_t nowS = millis() / 1000;  // genaugenommen brauchten wir RTC,
-    // aber NVS-Persist ueberlebt reboot - hier nur Heuristik. Wir benutzen
-    // immer den Cache, refresh erfolgt nur explizit per UI-Aktion.
-    (void)ts; (void)nowS;
     url   = (const char*)(doc["url"]   | "");
     name  = (const char*)(doc["name"]  | "");
     image = (const char*)(doc["image"] | "");
@@ -41,7 +47,6 @@ bool lookupCache(const String& id, String& url, String& name, String& image) {
 
 void saveCache(const String& id, const String& url, const String& name, const String& image) {
     JsonDocument doc;
-    doc["ts"]    = millis() / 1000;
     doc["url"]   = url;
     doc["name"]  = name;
     doc["image"] = image;
@@ -51,6 +56,7 @@ void saveCache(const String& id, const String& url, const String& name, const St
 bool fetchFromOpml(const String& id, String& url, String& name, String& image) {
     if (WiFi.status() != WL_CONNECTED) return false;
     HTTPClient http;
+    http.setReuse(false);
     http.setConnectTimeout(3000);
     http.setTimeout(5000);
 
@@ -128,26 +134,16 @@ String buildBoseJson(const String& id, const String& name, const String& url,
 
 namespace {
 bool findPresetOverride(const String& id, String& url, String& name, String& image) {
-    // Iteriere alle Speaker x 6 Slots, finde Eintrag mit stationId==id && streamUrl!=""
-    auto& store = PresetStore::instance();
-    // Wir haben hier keinen direkten "all-speakers"-Accessor - aber via
-    // den Inventory-Speakers koennen wir iterieren.
-    // Trick: PresetStore hat keinen public-Iterator, also gehen wir via
-    // exportJson und parsen dort.
-    JsonDocument doc;
-    store.exportJson(doc);
-    for (JsonObject ps : doc["speakers"].as<JsonArray>()) {
-        for (JsonObject pj : ps["presets"].as<JsonArray>()) {
-            if (String((const char*)(pj["stationId"] | "")) != id) continue;
-            String u = (const char*)(pj["streamUrl"] | "");
-            if (u.length() == 0) continue;
-            url   = u;
-            name  = (const char*)(pj["name"]     | "");
-            image = (const char*)(pj["imageUrl"] | "");
-            return true;
-        }
-    }
-    return false;
+    // Hot-Path: jeder Preset-Druck am Speaker landet hier ueber den TuneIn-
+    // Resolver. Direkter Lookup via PresetStore::findByStationId statt
+    // exportJson+Parse, sonst frisst das Heap+CPU bei jedem Tastendruck.
+    Preset p;
+    if (!PresetStore::instance().findByStationId(id, p)) return false;
+    if (p.streamUrl.length() == 0) return false;
+    url   = p.streamUrl;
+    name  = p.name;
+    image = p.imageUrl;
+    return true;
 }
 
 } // anon

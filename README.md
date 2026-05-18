@@ -21,7 +21,7 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 | Speaker telnet bootstrap (`sys configuration …` via TCP 17000)     | working                                              |
 | Auto-import existing presets via BMX `/presets`                    | working                                              |
 | **Auto-Mode** — discover + migrate + preserve presets on first boot | working — gated by NVS flag, default on             |
-| **Auto-Mode cron** — periodic re-check every 10 min when enabled    | working — light discovery + auto-claim/release + migrate newcomers |
+| **Auto-Mode cron** — periodic re-check every 30 min when enabled    | working — light discovery + auto-claim/release + migrate newcomers |
 | **Source-Normalizer** — TuneIn / Local / RadioBrowser → playable   | working — RadioBrowser UUID resolved via radio-browser.info |
 | **IP-Failsafe** — auto-remigrate on ESP-IP change, with pre-probe   | working — skips speakers already on the new base     |
 | Auto-Claim + Auto-Release symmetry on the inventory                | working — owned-by-us flips both ways on refresh     |
@@ -71,7 +71,7 @@ The default is "on" because the typical install path is *flash → provision
 gets touched.
 
 After the initial boot pass, BoseFix32 keeps the auto-mode pipeline alive
-as a **periodic cron** (default every 10 minutes, configurable via
+as a **periodic cron** (default every 30 minutes, configurable via
 `cron_interval_s`).  Each tick does a light discovery (SSDP + known-IP
 probe, no full `/24` sweep), runs Auto-Claim/Release on the inventory
 (so a speaker that someone else migrated away gets dropped from the

@@ -19,6 +19,7 @@ constexpr const char* KEY_IP  = "last_ip";
 // wie "unknown" und re-migriert vorsichtshalber.
 String fetchMargeUrl_(const String& ip) {
     HTTPClient http;
+    http.setReuse(false);
     http.setConnectTimeout(1500); http.setTimeout(2500);
     String url = "http://" + ip + ":" + String(BOSE_BMX_PORT) + "/info";
     if (!http.begin(url)) return "";
@@ -80,9 +81,12 @@ void ipFailsafeCheck() {
         if (live == newBase) {
             Serial.printf("[failsafe]   %s (%s) already on %s — skip\n",
                           s.name.c_str(), s.ip.c_str(), newBase.c_str());
-            if (auto* p = inv.findById(s.deviceId)) {
-                p->status   = MigrationStatus::MIGRATED;
-                p->cloudUrl = newBase;
+            {
+                SpeakerInventory::LockGuard g(inv);
+                if (auto* p = inv.findById(s.deviceId)) {
+                    p->status   = MigrationStatus::MIGRATED;
+                    p->cloudUrl = newBase;
+                }
             }
             ++skipped;
             continue;
@@ -94,6 +98,7 @@ void ipFailsafeCheck() {
         auto r = migrateSpeaker(s.ip, newBase);
         if (r.ok) {
             ++touched;
+            SpeakerInventory::LockGuard g(inv);
             if (auto* p = inv.findById(s.deviceId)) {
                 p->status   = MigrationStatus::MIGRATED;
                 p->cloudUrl = newBase;

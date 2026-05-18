@@ -47,6 +47,16 @@ void routeJsonBody(AsyncWebServer& s, const String& uri, WebRequestMethodComposi
             if (!req->_tempObject) {
                 req->_tempObject = new String();
                 ((String*)req->_tempObject)->reserve(total + 1);
+                // Framework-Destructor ruft free() auf _tempObject; das kennt
+                // den String-Heap-Buffer nicht und leakt ihn bei Abbruch.
+                // onDisconnect ueberbruecken: korrekt deleten + nullen, damit
+                // free(nullptr) im Destructor harmlos ist.
+                req->onDisconnect([req]() {
+                    if (req->_tempObject) {
+                        delete static_cast<String*>(req->_tempObject);
+                        req->_tempObject = nullptr;
+                    }
+                });
             }
             String* buf = (String*)req->_tempObject;
             buf->concat((const char*)data, len);
@@ -64,6 +74,30 @@ void routeJsonBody(AsyncWebServer& s, const String& uri, WebRequestMethodComposi
 
 String myBaseUrl() {
     return "http://" + WiFi.localIP().toString() + ":" + String(BOSE_HTTP_PORT);
+}
+
+// RFC3986-percent-encode fuer Query-Parameter. Nur die unreservierten
+// ASCII-Zeichen bleiben unverwandelt; alles andere wird %XX. Speziell
+// '&' muss escaped werden, sonst splittet ein User-Sucher wie "Bob & Friends"
+// die TuneIn-Search-URL in zwei Query-Parameter.
+String urlEncodeQuery_(const String& in) {
+    String out;
+    out.reserve(in.length() * 3);
+    for (size_t i = 0; i < in.length(); ++i) {
+        unsigned char c = (unsigned char)in.charAt(i);
+        bool unreserved = (c >= 'A' && c <= 'Z') ||
+                          (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') ||
+                          c == '-' || c == '_' || c == '.' || c == '~';
+        if (unreserved) {
+            out += (char)c;
+        } else {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -153,8 +187,27 @@ void handleSpeakersList(AsyncWebServerRequest* req) {
     emitSpeakers(req, doc);
 }
 
-void handleDiscover(AsyncWebServerRequest* req) {
+void discoverWorker_(void* /*arg*/) {
     bosefix::SpeakerInventory::instance().discover();
+    vTaskDelete(nullptr);
+}
+
+void handleDiscover(AsyncWebServerRequest* req) {
+    // Discover als Background-Task: knownIpProbe + SSDP-listen + refreshMigrationStatus
+    // brauchen zusammen ~5 s, danach laeuft der /24-Active-Scan weitere 30s+.
+    // Wir returnen sofort den aktuellen Snapshot — scan_in_progress=true signal-
+    // isiert dem UI dass es weiter pollen soll. Wenn discover() bereits laeuft,
+    // gibt's keinen weiteren Worker (compare_exchange in discover()) — wir
+    // returnen einfach den aktuellen Stand.
+    auto& inv = bosefix::SpeakerInventory::instance();
+    if (!inv.isScanRunning()) {
+        BaseType_t r = xTaskCreate(discoverWorker_, "bg-discover", 4096,
+                                    nullptr, tskIDLE_PRIORITY + 1, nullptr);
+        if (r != pdPASS) {
+            req->send(503, "application/json", "{\"error\":\"task spawn failed\"}");
+            return;
+        }
+    }
     JsonDocument doc;
     emitSpeakers(req, doc);
 }
@@ -176,49 +229,112 @@ void handleSpeakerDelete(AsyncWebServerRequest* req) {
 // -----------------------------------------------------------------------------
 // Speaker-Aktionen: migrate / revert / reboot / refresh-status
 // -----------------------------------------------------------------------------
+// Worker-Pattern fuer Long-IO-Handler:
+// Telnet auf TCP:17000 zum Speaker dauert 5-10 s. ESPAsyncWebServer laeuft
+// auf einem einzigen async_tcp-Task — solange er in einem Handler haengt,
+// blockieren ALLE anderen Requests (auch port 8000 Cloud-Mock). Deshalb:
+// Handler spawnt FreeRTOS-Task und returnt sofort 202+queued; das UI sieht
+// einen schnellen Erfolg und re-fetch'ed die speaker-Liste, was den
+// finalen Status zeigt sobald der Worker durch ist.
+struct MigrateJob_ {
+    String deviceId;
+    String ip;
+    String baseUrl;
+    bool   doMigrate;  // true=migrate, false=revert
+};
+
+void migrateRevertWorker_(void* arg) {
+    auto* job = static_cast<MigrateJob_*>(arg);
+    auto& inv = bosefix::SpeakerInventory::instance();
+    if (job->doMigrate) {
+        auto r = migrateSpeaker(job->ip, job->baseUrl);
+        Serial.printf("[bg:migrate] %s -> %s ok=%d msg=%s\n",
+                      job->deviceId.c_str(), job->baseUrl.c_str(),
+                      (int)r.ok, r.message.c_str());
+        if (r.ok) {
+            bosefix::SpeakerInventory::LockGuard g(inv);
+            if (auto* sp = inv.findById(job->deviceId)) {
+                sp->status    = bosefix::MigrationStatus::MIGRATED;
+                sp->cloudUrl  = job->baseUrl;
+                sp->ownedByUs = true;
+                inv.saveToNVS();
+            }
+        }
+    } else {
+        auto r = revertSpeaker(job->ip);
+        Serial.printf("[bg:revert] %s ok=%d msg=%s\n",
+                      job->deviceId.c_str(), (int)r.ok, r.message.c_str());
+        if (r.ok) {
+            bosefix::SpeakerInventory::LockGuard g(inv);
+            if (auto* sp = inv.findById(job->deviceId)) {
+                sp->status    = bosefix::MigrationStatus::NOT_MIGRATED;
+                sp->cloudUrl  = "https://streaming.bose.com";
+                sp->ownedByUs = false;
+                inv.saveToNVS();
+            }
+        }
+    }
+    delete job;
+    vTaskDelete(nullptr);
+}
+
 void handleMigrate(AsyncWebServerRequest* req) {
     String id = req->pathArg(0);
-    auto* sp = bosefix::SpeakerInventory::instance().findById(id);
-    if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
-    auto r = migrateSpeaker(sp->ip, myBaseUrl());
-    if (r.ok) {
-        sp->status     = bosefix::MigrationStatus::MIGRATED;
-        sp->cloudUrl   = myBaseUrl();
-        sp->ownedByUs  = true;   // gehoert ab jetzt UNS - ip_failsafe pflegt es
-        bosefix::SpeakerInventory::instance().saveToNVS();
+    auto& inv = bosefix::SpeakerInventory::instance();
+    String ip;
+    {
+        bosefix::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        ip = sp->ip;
     }
-    JsonDocument doc;
-    doc["ok"]              = r.ok;
-    doc["message"]         = r.message;
-    doc["verified_config"] = r.verifiedConfig;
-    String body; serializeJson(doc, body);
-    req->send(r.ok ? 200 : 500, "application/json", body);
+    auto* job = new MigrateJob_{id, ip, myBaseUrl(), /*doMigrate=*/true};
+    BaseType_t r = xTaskCreate(migrateRevertWorker_, "bg-migrate", 4096, job,
+                                tskIDLE_PRIORITY + 1, nullptr);
+    if (r != pdPASS) {
+        delete job;
+        req->send(503, "application/json", "{\"error\":\"task spawn failed\"}");
+        return;
+    }
+    req->send(202, "application/json",
+              "{\"ok\":true,\"queued\":true,"
+              "\"message\":\"migration started in background — refresh speaker card in ~10s to see result\"}");
 }
 
 void handleRevert(AsyncWebServerRequest* req) {
     String id = req->pathArg(0);
-    auto* sp = bosefix::SpeakerInventory::instance().findById(id);
-    if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
-    auto r = revertSpeaker(sp->ip);
-    if (r.ok) {
-        sp->status    = bosefix::MigrationStatus::NOT_MIGRATED;
-        sp->cloudUrl  = "https://streaming.bose.com";
-        sp->ownedByUs = false;
-        bosefix::SpeakerInventory::instance().saveToNVS();
+    auto& inv = bosefix::SpeakerInventory::instance();
+    String ip;
+    {
+        bosefix::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        ip = sp->ip;
     }
-    JsonDocument doc;
-    doc["ok"]              = r.ok;
-    doc["message"]         = r.message;
-    doc["verified_config"] = r.verifiedConfig;
-    String body; serializeJson(doc, body);
-    req->send(r.ok ? 200 : 500, "application/json", body);
+    auto* job = new MigrateJob_{id, ip, myBaseUrl(), /*doMigrate=*/false};
+    BaseType_t r = xTaskCreate(migrateRevertWorker_, "bg-revert", 4096, job,
+                                tskIDLE_PRIORITY + 1, nullptr);
+    if (r != pdPASS) {
+        delete job;
+        req->send(503, "application/json", "{\"error\":\"task spawn failed\"}");
+        return;
+    }
+    req->send(202, "application/json",
+              "{\"ok\":true,\"queued\":true,"
+              "\"message\":\"revert started in background — refresh speaker card in ~10s to see result\"}");
 }
 
 void handleReboot(AsyncWebServerRequest* req) {
     String id = req->pathArg(0);
-    auto* sp = bosefix::SpeakerInventory::instance().findById(id);
-    if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
-    bool ok = rebootSpeaker(sp->ip);
+    auto& inv = bosefix::SpeakerInventory::instance();
+    String ip;
+    {
+        bosefix::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        ip = sp->ip;
+    }
+    bool ok = rebootSpeaker(ip);
     req->send(ok ? 200 : 500, "application/json",
               ok ? "{\"ok\":true,\"message\":\"speaker reboot triggered\"}"
                  : "{\"error\":\"telnet failed\"}");
@@ -256,7 +372,17 @@ void handlePutPreset(AsyncWebServerRequest* req, JsonDocument& body) {
     if (slot < 1 || slot > 6) { req->send(400, "application/json", "{\"error\":\"slot 1..6\"}"); return; }
     bosefix::Preset p;
     p.slot      = slot;
-    p.source    = bosefix::presetSourceFromStr(String((const char*)(body["source"] | "TUNEIN")));
+    // source-Validierung an der Grenze: presetSourceFromStr returnt EMPTY
+    // fuer unbekannte Strings (silent default), was sonst zu einem nicht
+    // abspielbaren Preset-Slot fuehrt der den User irritiert. Lieber 400.
+    String srcStr = String((const char*)(body["source"] | "TUNEIN"));
+    p.source    = bosefix::presetSourceFromStr(srcStr);
+    if (p.source == bosefix::PresetSource::EMPTY && srcStr != "EMPTY") {
+        req->send(400, "application/json",
+                  String("{\"error\":\"unknown source\",\"got\":\"") + srcStr +
+                  "\",\"expected\":\"TUNEIN | LOCAL_INTERNET_RADIO\"}");
+        return;
+    }
     p.name      = (const char*)(body["name"]      | "");
     p.stationId = (const char*)(body["stationId"] | "");
     p.streamUrl = (const char*)(body["streamUrl"] | "");
@@ -303,11 +429,18 @@ String xmlExtractTag(const String& xml, int start, int end, const String& tag) {
 
 void handleImportFromDevice(AsyncWebServerRequest* req) {
     String id = req->pathArg(0);
-    auto* sp = bosefix::SpeakerInventory::instance().findById(id);
-    if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+    auto& inv = bosefix::SpeakerInventory::instance();
+    String spIp;
+    {
+        bosefix::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        spIp = sp->ip;
+    }
 
     HTTPClient http;
-    String url = "http://" + sp->ip + ":" + String(BOSE_BMX_PORT) + "/presets";
+    http.setReuse(false);
+    String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/presets";
     http.setConnectTimeout(2000); http.setTimeout(3000);
     if (!http.begin(url)) {
         req->send(500, "application/json", "{\"error\":\"http begin\"}"); return;
@@ -327,6 +460,10 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
     JsonArray abandoned = resp["abandoned"].to<JsonArray>();
     int countOk = 0, countAban = 0;
     int pos = 0;
+    // Sammelt alle erfolgreich normalisierten Presets, damit am Ende EIN
+    // setSlots-Aufruf statt 6 einzelner set() — 1 NVS-Write statt bis zu 6.
+    std::vector<bosefix::Preset> toSet;
+    toSet.reserve(6);
     while (true) {
         int presetOpen = xml.indexOf("<preset id=\"", pos);
         if (presetOpen < 0) break;
@@ -353,7 +490,8 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
             o["source"] = src;
             o["reason"] = nr.reason;
             ++countAban;
-        } else if (bosefix::PresetStore::instance().set(id, p)) {
+        } else {
+            toSet.push_back(p);
             JsonObject o = imported.add<JsonObject>();
             o["slot"]            = p.slot;
             o["name"]            = p.name;
@@ -370,6 +508,10 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
         pos = presetClose;
     }
 
+    // Batched-Save: alle erfolgreich normalisierten Presets in einem
+    // NVS-Write statt einer pro Slot.
+    bosefix::PresetStore::instance().setSlots(id, toSet);
+
     resp["ok"]            = true;
     resp["count"]         = countOk;
     resp["abandoned_count"] = countAban;
@@ -380,52 +522,82 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
 // POST /api/speaker/{id}/preset/{slot}/push-to-device
 //   speichert das aktuelle Preset am echten Speaker (Long-Press-Simulation):
 //   /select mit ContentItem → /key press PRESET_n → 2.5s → /key release PRESET_n
-void handlePushPresetToDevice(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
-    auto* sp = bosefix::SpeakerInventory::instance().findById(id);
-    if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
-    auto p = bosefix::PresetStore::instance().get(id, slot);
-    if (p.source == bosefix::PresetSource::EMPTY) {
-        req->send(400, "application/json", "{\"error\":\"empty slot\"}"); return;
-    }
-    // Speaker /select mit ContentItem
-    HTTPClient http;
-    String url = "http://" + sp->ip + ":" + String(BOSE_BMX_PORT) + "/select";
-    if (!http.begin(url)) { req->send(500, "application/json", "{\"error\":\"http begin failed\"}"); return; }
-    String ci = "<ContentItem source=\"";
-    ci += bosefix::presetSourceToStr(p.source);
-    ci += "\" type=\"stationurl\" location=\"";
-    if (p.source == bosefix::PresetSource::TUNEIN) {
-        ci += "/v1/playback/station/" + p.stationId;
-    } else {
-        ci += p.streamUrl;
-    }
-    ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + p.name + "</itemName></ContentItem>";
-    http.addHeader("Content-Type", "text/xml");
-    int code = http.POST(ci);
-    http.end();
-    delay(4000);  // Stream stabilisieren
+//
+// 4 s + 2.5 s = 6.5 s sind hartes Bose-Timing, nicht verkuerzbar — daher
+// als Background-Task wie Migrate/Revert, damit der async_tcp-Thread frei
+// bleibt.
+struct PushPresetJob_ {
+    String spIp;
+    bosefix::Preset p;
+};
 
+void pushPresetWorker_(void* arg) {
+    auto* job = static_cast<PushPresetJob_*>(arg);
+    HTTPClient http;
+    http.setReuse(false);
+    String url = "http://" + job->spIp + ":" + String(BOSE_BMX_PORT) + "/select";
+    int selectCode = -1;
+    if (http.begin(url)) {
+        String ci = "<ContentItem source=\"";
+        ci += bosefix::presetSourceToStr(job->p.source);
+        ci += "\" type=\"stationurl\" location=\"";
+        if (job->p.source == bosefix::PresetSource::TUNEIN) {
+            ci += "/v1/playback/station/" + job->p.stationId;
+        } else {
+            ci += job->p.streamUrl;
+        }
+        ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + job->p.name + "</itemName></ContentItem>";
+        http.addHeader("Content-Type", "text/xml");
+        selectCode = http.POST(ci);
+        http.end();
+    }
+    delay(4000);  // Stream stabilisieren
     // Long-Press PRESET_n
     auto sendKey = [&](const String& state) {
         HTTPClient h;
-        String u = "http://" + sp->ip + ":" + String(BOSE_BMX_PORT) + "/key";
+        h.setReuse(false);
+        String u = "http://" + job->spIp + ":" + String(BOSE_BMX_PORT) + "/key";
         if (!h.begin(u)) return;
         h.addHeader("Content-Type", "text/xml");
-        String body = "<key state=\"" + state + "\" sender=\"Gabbo\">PRESET_" + String(p.slot) + "</key>";
+        String body = "<key state=\"" + state + "\" sender=\"Gabbo\">PRESET_" + String(job->p.slot) + "</key>";
         h.POST(body);
         h.end();
     };
     sendKey("press");
     delay(2500);  // > 2s = Long-Press
     sendKey("release");
+    Serial.printf("[bg:push-preset] %s slot %u select=%d done\n",
+                  job->spIp.c_str(), job->p.slot, selectCode);
+    delete job;
+    vTaskDelete(nullptr);
+}
 
-    JsonDocument doc;
-    doc["ok"] = code == 200;
-    doc["http_select"] = code;
-    String body; serializeJson(doc, body);
-    req->send(200, "application/json", body);
+void handlePushPresetToDevice(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    uint8_t slot = req->pathArg(1).toInt();
+    auto& inv = bosefix::SpeakerInventory::instance();
+    String spIp;
+    {
+        bosefix::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        spIp = sp->ip;
+    }
+    auto p = bosefix::PresetStore::instance().get(id, slot);
+    if (p.source == bosefix::PresetSource::EMPTY) {
+        req->send(400, "application/json", "{\"error\":\"empty slot\"}"); return;
+    }
+    auto* job = new PushPresetJob_{spIp, p};
+    BaseType_t r = xTaskCreate(pushPresetWorker_, "bg-push", 4096, job,
+                                tskIDLE_PRIORITY + 1, nullptr);
+    if (r != pdPASS) {
+        delete job;
+        req->send(503, "application/json", "{\"error\":\"task spawn failed\"}");
+        return;
+    }
+    req->send(202, "application/json",
+              "{\"ok\":true,\"queued\":true,"
+              "\"message\":\"preset push started in background — physical button press in ~7s\"}");
 }
 
 // -----------------------------------------------------------------------------
@@ -434,10 +606,12 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
 void handlePutGroup(AsyncWebServerRequest* req, JsonDocument& body) {
     String id = req->pathArg(0);
     String groupId = (const char*)(body["group_id"] | "");
-    auto* sp = bosefix::SpeakerInventory::instance().findById(id);
+    auto& inv = bosefix::SpeakerInventory::instance();
+    bosefix::SpeakerInventory::LockGuard g(inv);
+    auto* sp = inv.findById(id);
     if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown\"}"); return; }
     sp->groupId = groupId;
-    bosefix::SpeakerInventory::instance().saveToNVS();
+    inv.saveToNVS();
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -485,8 +659,9 @@ void handleTuneInSearch(AsyncWebServerRequest* req) {
     if (q.length() == 0) { req->send(400, "application/json", "{\"error\":\"q required\"}"); return; }
     if (WiFi.status() != WL_CONNECTED) { req->send(503, "application/json", "{\"error\":\"offline\"}"); return; }
     HTTPClient http;
+    http.setReuse(false);
     http.setConnectTimeout(3000); http.setTimeout(5000);
-    String url = "http://opml.radiotime.com/Search.ashx?query=" + q + "&render=json";
+    String url = "http://opml.radiotime.com/Search.ashx?query=" + urlEncodeQuery_(q) + "&render=json";
     if (!http.begin(url)) { req->send(500, "application/json", "{\"error\":\"begin\"}"); return; }
     int code = http.GET();
     if (code != 200) { http.end(); req->send(502, "application/json", "{\"error\":\"upstream\"}"); return; }

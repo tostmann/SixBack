@@ -84,6 +84,7 @@ String xmlTag_(const String& xml, int beg, int end, const char* tag) {
 bool importAndNormalizePresets_(const Speaker& s,
                                 int& converted, int& abandoned, int& total) {
     HTTPClient http;
+    http.setReuse(false);
     http.setConnectTimeout(2000); http.setTimeout(4000);
     String url = "http://" + s.ip + ":" + String(BOSE_BMX_PORT) + "/presets";
     if (!http.begin(url)) return false;
@@ -93,6 +94,8 @@ bool importAndNormalizePresets_(const Speaker& s,
     http.end();
 
     int pos = 0;
+    std::vector<Preset> toSet;  // batched-save am Ende statt einer pro Slot
+    toSet.reserve(6);
     while (true) {
         int presetOpen = xml.indexOf("<preset id=\"", pos);
         if (presetOpen < 0) break;
@@ -122,10 +125,11 @@ bool importAndNormalizePresets_(const Speaker& s,
             ++abandoned;
         } else {
             if (nr.status == NormalizeStatus::OK_CONVERTED) ++converted;
-            PresetStore::instance().set(s.deviceId, p);
+            toSet.push_back(p);
         }
         pos = presetClose;
     }
+    PresetStore::instance().setSlots(s.deviceId, toSet);  // 1 NVS-Write
     return true;
 }
 
@@ -133,9 +137,20 @@ bool importAndNormalizePresets_(const Speaker& s,
 bool waitForSpeakerBack_(const String& ip, uint32_t timeoutMs) {
     uint32_t start = millis();
     // erste 30 s: Speaker reboot't gerade — Probes sind aussichtslos.
-    delay(30000);
+    // Chunked delay statt monolithische delay(30000): (a) erlaubt WDT-Reset
+    // falls die Task spaeter mal esp_task_wdt_add(NULL) bekommt, (b) der UI
+    // bekommt ueber g_status.state einen sichtbaren Sekunden-Countdown.
+    for (int sec = 30; sec > 0; --sec) {
+        {
+            Lock_ l;
+            g_status.state = String("wait-reboot (") + sec + "s)";
+        }
+        delay(1000);
+    }
+    setState_("wait-reboot probing");
     while (millis() - start < timeoutMs) {
         HTTPClient http;
+        http.setReuse(false);
         http.setConnectTimeout(1500); http.setTimeout(2000);
         String url = "http://" + ip + ":" + String(BOSE_BMX_PORT) + "/info";
         if (http.begin(url)) {
@@ -168,18 +183,22 @@ bool isEligible_(const Speaker& s, const String& myBase) {
     return true;
 }
 
-void migrateOne_(Speaker& live) {
+// Migration eines Speakers per Wert-Snapshot uebergeben; das vermeidet,
+// dass eine Speaker&-Referenz quer durch mehrere Sekunden Telnet/IO
+// gehalten wird, waehrend andere Tasks den inventory-vector reallocieren
+// koennten. Schreibt das Ergebnis am Schluss unter Lock zurueck.
+void migrateOne_(const Speaker& snap) {
     {
         Lock_ l;
-        g_status.currentDeviceId = live.deviceId;
+        g_status.currentDeviceId = snap.deviceId;
     }
     Serial.printf("[auto] === migrate %s (%s @ %s) ===\n",
-                  live.name.c_str(), live.deviceId.c_str(), live.ip.c_str());
+                  snap.name.c_str(), snap.deviceId.c_str(), snap.ip.c_str());
 
     setState_("import-presets");
     int converted = 0, abandoned = 0, total = 0;
-    if (!importAndNormalizePresets_(live, converted, abandoned, total)) {
-        setError_("preset import failed for " + live.deviceId);
+    if (!importAndNormalizePresets_(snap, converted, abandoned, total)) {
+        setError_("preset import failed for " + snap.deviceId);
         return;
     }
     {
@@ -189,32 +208,38 @@ void migrateOne_(Speaker& live) {
         g_status.slotsAbandoned  += abandoned;
     }
     if (total == 0) {
-        setError_("speaker " + live.deviceId + " has no readable presets — skip");
+        setError_("speaker " + snap.deviceId + " has no readable presets — skip");
         return;
     }
     if (total - abandoned == 0) {
-        setError_("speaker " + live.deviceId + " has only unsupported sources — skip");
+        setError_("speaker " + snap.deviceId + " has only unsupported sources — skip");
         return;
     }
 
     setState_("migrate-telnet");
     auto base = myBase_();
-    auto r = migrateSpeaker(live.ip, base);
+    auto r = migrateSpeaker(snap.ip, base);
     if (!r.ok) {
         setError_("telnet migration failed: " + r.message);
         return;
     }
 
     setState_("wait-reboot");
-    if (!waitForSpeakerBack_(live.ip, 180000)) {
-        setError_("speaker " + live.ip + " did not come back within 180s");
+    if (!waitForSpeakerBack_(snap.ip, 180000)) {
+        setError_("speaker " + snap.ip + " did not come back within 180s");
         return;
     }
 
-    live.status    = MigrationStatus::MIGRATED;
-    live.cloudUrl  = base;
-    live.ownedByUs = true;
-    SpeakerInventory::instance().saveToNVS();
+    auto& inv = SpeakerInventory::instance();
+    {
+        SpeakerInventory::LockGuard ig(inv);
+        if (auto* live = inv.findById(snap.deviceId)) {
+            live->status    = MigrationStatus::MIGRATED;
+            live->cloudUrl  = base;
+            live->ownedByUs = true;
+        }
+        inv.saveToNVS();
+    }
 
     {
         Lock_ l;
@@ -222,7 +247,7 @@ void migrateOne_(Speaker& live) {
         g_status.currentDeviceId = "";
     }
     Serial.printf("[auto] === %s migrated → %s ===\n",
-                  live.deviceId.c_str(), base.c_str());
+                  snap.deviceId.c_str(), base.c_str());
 }
 
 // Ein kompletter Migrations-Pass. `deep=true` ist die Initial-Boot-Variante
@@ -272,15 +297,16 @@ bool runMigrationPass_(const AutoModeConfig& cfg, bool deep) {
     } else {
         uint32_t doneThisPass = 0;
         for (auto& snap : snapshot) {
-            auto* live = SpeakerInventory::instance().findById(snap.deviceId);
-            if (!live) continue;
-            if (!isEligible_(*live, base)) continue;
+            // Eligibility wird auf der Snapshot-Kopie gemacht — der State
+            // im inventory kann sich zwischen list() und Migration aendern,
+            // aber das ist akzeptabel: bei naechstem Cron-Tick neu evaluiert.
+            if (!isEligible_(snap, base)) continue;
             if (doneThisPass >= cfg.maxPerBoot) {
                 Serial.printf("[auto] maxPerBoot=%u reached — stop\n",
                               cfg.maxPerBoot);
                 break;
             }
-            migrateOne_(*live);
+            migrateOne_(snap);
             ++doneThisPass;
         }
         setState_(deep ? "done" : "cron-idle");
@@ -325,17 +351,22 @@ void autoModeTask_(void* /*arg*/) {
         uint32_t intervalMs = (cfg.cronIntervalS < 60 ? 60 : cfg.cronIntervalS) * 1000;
         if (cfg.cronIntervalS == 0) {
             // Cron disabled — schlafe trotzdem, damit Task lebt und Toggle greift
+            {
+                Lock_ l;
+                g_status.sleepStartMs = millis();
+                g_status.sleepDurMs   = 60000;
+            }
             delay(60000);
             continue;
         }
-        // Sleep + Countdown pro Sekunde, damit Status.nextTickInS sinnvoll bleibt
-        uint32_t sleepStart = millis();
-        while (millis() - sleepStart < intervalMs) {
-            uint32_t elapsed   = (millis() - sleepStart) / 1000;
-            uint32_t remaining = (intervalMs / 1000) - elapsed;
-            { Lock_ l; g_status.nextTickInS = remaining; }
-            delay(1000);
+        // Anker setzen, getAutoModeStatus leitet nextTickInS daraus ab.
+        // Kein per-Sekunden-Write mehr unter Lock.
+        {
+            Lock_ l;
+            g_status.sleepStartMs = millis();
+            g_status.sleepDurMs   = intervalMs;
         }
+        delay(intervalMs);
         // Tick aktivieren
         cfg = loadAutoModeConfig();
         if (!cfg.enabled) {
@@ -359,7 +390,7 @@ AutoModeConfig loadAutoModeConfig() {
         c.dryRun        = doc["dry_run"]         | false;
         c.bootDelayMs   = doc["boot_delay_ms"]   | (uint32_t)10000;
         c.maxPerBoot    = doc["max_per_boot"]    | (uint32_t)4;
-        c.cronIntervalS = doc["cron_interval_s"] | (uint32_t)600;
+        c.cronIntervalS = doc["cron_interval_s"] | (uint32_t)1800;
     }
     return c;
 }
@@ -385,7 +416,18 @@ void startAutoModeTask() {
 AutoModeStatus getAutoModeStatus() {
     initMutex_();
     Lock_ l;
-    return g_status;
+    AutoModeStatus snap = g_status;
+    // Ableitung statt Per-Sekunden-Push: aus sleepStartMs + sleepDurMs
+    // berechnen wie viel Sekunden bis zum naechsten Tick uebrig sind.
+    if (snap.sleepDurMs > 0) {
+        uint32_t elapsed = millis() - snap.sleepStartMs;
+        snap.nextTickInS = (elapsed >= snap.sleepDurMs)
+                            ? 0
+                            : (snap.sleepDurMs - elapsed) / 1000;
+    } else {
+        snap.nextTickInS = 0;
+    }
+    return snap;
 }
 
 } // namespace bosefix

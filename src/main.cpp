@@ -40,11 +40,22 @@ static void banner() {
 }
 
 static void mountFS() {
-    if (!LittleFS.begin(true)) {  // format on failure
-        Serial.println("[fs]   LittleFS mount failed (formatted)");
+    // Erst no-format probieren — wenn das klappt, ist alles normal.
+    if (LittleFS.begin(false)) {
+        Serial.printf("[fs]   LittleFS mounted, %u/%u bytes used\n",
+                      (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
         return;
     }
-    Serial.printf("[fs]   LittleFS mounted, %u/%u bytes used\n",
+    // Mount failed (z.B. Brownout-Korruption oder erster Boot nach Erase).
+    // Jetzt explizit formatieren MIT Log — sonst wuerde die WebUI lautlos
+    // verschwinden und der Bose-Cloud-Mock haette keine bmx_services.json
+    // mehr zum Ausliefern.
+    Serial.println("[fs]   LittleFS mount failed — formatting (WebUI must be re-uploaded via /api/ota/fs)");
+    if (!LittleFS.begin(true)) {
+        Serial.println("[fs]   LittleFS format ALSO failed — FS unavailable");
+        return;
+    }
+    Serial.printf("[fs]   LittleFS formatted, %u/%u bytes used\n",
                   (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
 }
 

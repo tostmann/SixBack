@@ -27,7 +27,7 @@ struct AutoModeConfig {
     bool      dryRun        = false;
     uint32_t  bootDelayMs   = 10000;
     uint32_t  maxPerBoot    = 4;      // typischer Haushalt 1-4 SoundTouch — alle in einem Boot durch
-    uint32_t  cronIntervalS = 600;    // periodischer Check alle 10 min wenn enabled
+    uint32_t  cronIntervalS = 1800;   // periodischer Check alle 30 min wenn enabled
                                        //   - light discovery (SSDP + knownIpProbe, kein /24-Sweep)
                                        //   - refreshMigrationStatus (Auto-Claim/Release-Symmetrie)
                                        //   - migrate neu erschienene eligible Speaker bis maxPerBoot
@@ -51,6 +51,12 @@ struct AutoModeStatus {
     uint32_t  tickCount          = 0;       // 1 = initial boot pass, +1 per cron tick
     uint32_t  lastTickFinishedMs = 0;       // for UI countdown to next tick
     uint32_t  nextTickInS        = 0;       // computed snapshot, seconds until next cron tick
+    // Anker fuer die nextTickInS-Ableitung in getAutoModeStatus.  Wird beim
+    // Start eines Sleep-Intervalls einmal gesetzt; getAutoModeStatus rechnet
+    // remaining = (intervalMs - (millis() - sleepStartMs)) / 1000 — kein
+    // per-Sekunden-Write mehr unter Lock.
+    uint32_t  sleepStartMs       = 0;
+    uint32_t  sleepDurMs         = 0;
 };
 
 AutoModeConfig loadAutoModeConfig();

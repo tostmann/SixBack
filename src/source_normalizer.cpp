@@ -27,6 +27,7 @@ bool resolveRadioBrowserUuid(const String& uuid,
                              String& outImage) {
     if (uuid.length() < 8) return false;
     HTTPClient http;
+    http.setReuse(false);  // single-shot probe — kein TIME_WAIT-pcb-leak
     http.setConnectTimeout(4000);
     http.setTimeout(6000);
     http.setUserAgent("BoseFix32/1.0 (+https://github.com/tostmann/BoseFix32)");

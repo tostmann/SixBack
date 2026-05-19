@@ -31,3 +31,8 @@ HARDWARE_STATUS.md
 schematics/
 datasheets/
 datasheet/
+
+# Interne Projekt-Doku (Forschungs-Notes, Sweep-Memos, Adoption-Pläne,
+# Pre-Release-Test-Protokolle) — nicht für Public-Repo. Bleibt lokal als
+# Entwickler-Referenz.
+docs/

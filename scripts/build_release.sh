@@ -57,11 +57,15 @@ merge_target() {
 #   S3 / C3 / C6 / S2 / C2 / C5 / C61 / H2 / P4: 0x0
 # spiffs offsets must match the corresponding partition table:
 #   partitions.csv      (16 MB) -> spiffs @ 0x610000
-#   partitions-4mb.csv  ( 4 MB) -> spiffs @ 0x370000
-merge_target esp32 esp32   4MB  0x370000  0x1000
+#   partitions-4mb.csv  ( 4 MB) -> spiffs @ 0x390000  (geaendert 2026-05-19,
+#       app-Slots von 0x1B0000 -> 0x1C0000 vergroessert; spiffs auf 384 KB
+#       verkleinert. Wer das mal wieder anpasst: hier mitziehen, sonst
+#       landet das LittleFS-Image im falschen Flash-Bereich und der
+#       Web-Flasher liefert kaputte Factory-Images aus.)
+merge_target esp32 esp32   4MB  0x390000  0x1000
 merge_target s3    esp32s3 16MB 0x610000  0x0
-merge_target c3    esp32c3 4MB  0x370000  0x0
-merge_target c6    esp32c6 4MB  0x370000  0x0
+merge_target c3    esp32c3 4MB  0x390000  0x0
+merge_target c6    esp32c6 4MB  0x390000  0x0
 
 # --- 3) Generate esp-web-tools manifest with current version -------------
 cat > "$OUT/manifest.json" <<EOF

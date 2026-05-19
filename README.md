@@ -15,11 +15,15 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 
 | Component                                                          | State                                                |
 | ------------------------------------------------------------------ | ---------------------------------------------------- |
-| Cloud replacement (`/bmx/registry`, `/streaming/…`, `/updates/…`)  | working                                              |
+| Cloud replacement (`/bmx/registry`, `/streaming/…`, `/updates/…`)  | working — 22 / 30 ueberboese-spec endpoints served   |
+| **Marge pair-bootstrap** (`/setMargeAccount` round-trip)           | working — `/streaming/account/{a}/device/` echoes deviceid with Bearer-credentials |
+| **scmudc telemetry** — per-device NowPlaying + event trace         | working — body-captured `/v1/scmudc/{deviceId}` JSON parsed into per-speaker store |
 | TuneIn preset resolver (`Tune.ashx` + `Describe.ashx`)             | working — stations show with correct name & artwork  |
-| Preset push to speaker (long-press emulation)                      | working                                              |
+| Preset push to speaker (long-press emulation)                      | working — `sourceAccount="TuneIn"` set explicitly so /select doesn't 500 |
+| **Preset-loss defense** (Defense-in-Depth, v0.5.0)                 | working — `handleMigrate` pre-imports from speaker, `/presets` returns 404 instead of empty XML when store is unseeded |
 | Speaker telnet bootstrap (`sys configuration …` via TCP 17000)     | working                                              |
 | Auto-import existing presets via BMX `/presets`                    | working                                              |
+| **Stereo-Pair / Multi-Room group API**                             | working — POST/PUT/DELETE on `/streaming/account/{a}/group/`, NVS-persistent |
 | **Auto-Mode** — discover + migrate + preserve presets on first boot | working — gated by NVS flag, default on             |
 | **Auto-Mode cron** — periodic re-check every 30 min when enabled    | working — light discovery + auto-claim/release + migrate newcomers |
 | **Source-Normalizer** — TuneIn / Local / RadioBrowser → playable   | working — RadioBrowser UUID resolved via radio-browser.info |
@@ -64,7 +68,7 @@ Once it is on your WiFi, it will:
 
 If you'd rather drive each migration by hand, **turn the switch off at
 the very top of `http://bosefix.local/`** *before* the device finds your
-speakers — or [pre-disable via `PUT /api/auto-mode`](docs/CONFIGURATION.md).
+speakers — or pre-disable it via `PUT /api/auto-mode` (Body: `{"enabled":false}`).
 The default is "on" because the typical install path is *flash → provision
 → presets work*, and the foot-gun guards (eligibility whitelists,
 `max_per_boot=4`) are tight enough that nothing unrelated on your LAN
@@ -188,6 +192,22 @@ partitions.csv        16 MB partition table  (ESP32-S3 16-MB modules)
 partitions-4mb.csv    4 MB partition table   (ESP32 / C3 / C6)
 platformio.ini        Multi-env config, see `[common]` + `[env:*]`
 ```
+
+## Acknowledgements
+
+- **[julius-d/ueberboese-api](https://github.com/julius-d/ueberboese-api)** —
+  OpenAPI specification of the legacy Bose SoundTouch streaming cloud,
+  reconstructed from observed traffic. It is BoseFix32's verifiable
+  ground-truth for endpoint shapes, header semantics, and event-body
+  formats (scmudc envelope, NowPlaying structure, kebab-case event
+  types, group/preset XML). The v0.5.0 endpoint coverage and the
+  preset-loss defense both came directly out of consulting this spec
+  before implementing each path. Thanks to **julius-d** for publishing it.
+
+- **[tostmann/ip4knx](https://github.com/tostmann/ip4knx)** — sister
+  project. The dual-path WiFi provisioning (Improv + Captive in
+  parallel) and the system-health / self-ping watchdog pattern are
+  carried over from there.
 
 ## Disclaimer
 

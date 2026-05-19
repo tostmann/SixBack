@@ -7,7 +7,14 @@
 #define BOSEFIX32_BOSE_ENDPOINTS_H
 
 #include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 
 void registerBoseEndpoints(AsyncWebServer& server);
+
+// Catch-all-Logger (P3 aus UEBERBOESE_ADOPTION_PLAN.md): jeder unbekannte Path
+// landet in einem RAM-Ringbuffer (50 Eintraege). Fuer Endpoint-Forensik
+// (welche Paths fragt der Speaker eigentlich an).
+void getUnknownRequestsJson(JsonArray out);
+void clearUnknownRequests();
 
 #endif // BOSEFIX32_BOSE_ENDPOINTS_H

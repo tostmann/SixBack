@@ -81,6 +81,15 @@ public:
     // im Bose-XML-Format - alle Slots fuer den deviceId.
     String toBoseXml(const String& deviceId);
 
+    // True wenn fuer das Device mindestens ein nicht-EMPTY-Slot existiert.
+    // Genutzt von den Cloud-Mock-Endpoints um zu entscheiden, ob ueberhaupt
+    // ein <presets>-Element ausgegeben wird — bei "false" liefern wir 404
+    // (Cloud sagt "kein Mandat") und der Speaker behaelt seinen lokalen
+    // Preset-Cache statt ihn mit unserer leeren Liste zu ueberschreiben.
+    // Das ist die wichtigste Schutzlinie gegen Preset-Verlust durch Migration
+    // wenn der Store nach Erase noch leer ist.
+    bool hasAnyFor(const String& deviceId);
+
     // Hot-Path-Lookup fuer TuneIn-Resolve: iteriert alle Speaker × 6 Slots
     // und liefert das erste Preset mit stationId==id zurueck. Vermeidet
     // exportJson()-Builds, die bei jedem Preset-Druck am Speaker getriggert

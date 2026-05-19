@@ -21,6 +21,8 @@
 #include "captive_portal.h"
 #include "auto_mode.h"
 #include "source_normalizer.h"
+#include "bose_endpoints.h"
+#include "event_store.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
@@ -243,6 +245,14 @@ struct MigrateJob_ {
     bool   doMigrate;  // true=migrate, false=revert
 };
 
+// Forward-decl: Import-Helper liegt weiter unten (vor handleImportFromDevice).
+// handleMigrate ruft ihn vor migrate-trigger auf, damit der Speaker NIE eine
+// Migration auf einen leeren Preset-Store erlebt — sonst verliert er beim
+// ersten Sync seinen Local-Cache.
+int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
+                              int& httpCodeOut, JsonArray imported,
+                              JsonArray abandoned);
+
 void migrateRevertWorker_(void* arg) {
     auto* job = static_cast<MigrateJob_*>(arg);
     auto& inv = bosefix::SpeakerInventory::instance();
@@ -288,6 +298,32 @@ void handleMigrate(AsyncWebServerRequest* req) {
         if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
         ip = sp->ip;
     }
+
+    // SCHUTZ gegen Preset-Verlust (2026-05-19): wenn unser Store fuer das
+    // Device noch leer ist, MUSS vorher import-from-device passieren — sonst
+    // antwortet handleDevicePresets dem Speaker mit <presets/> und der
+    // ueberschreibt seinen Local-Cache. handleDevicePresets selbst schickt
+    // jetzt zwar 404 bei leerem Store, aber wir wollen den Migrate sowieso
+    // erst freischalten, wenn die Presets im Store sind.
+    if (!bosefix::PresetStore::instance().hasAnyFor(id)) {
+        int countOk = 0, countAban = 0, httpCode = 0;
+        int status = importPresetsFromSpeaker_(id, countOk, countAban, httpCode,
+                                                JsonArray(), JsonArray());
+        Serial.printf("[migrate-safe] %s pre-import status=%d ok=%d aban=%d "
+                      "speakerhttp=%d store-now-has=%d\n",
+                      id.c_str(), status, countOk, countAban, httpCode,
+                      (int)bosefix::PresetStore::instance().hasAnyFor(id));
+        if (status != 200) {
+            String err = "{\"error\":\"pre-migrate preset-import failed (status ";
+            err += status; err += ")\",\"speaker_http\":"; err += httpCode; err += "}";
+            req->send(409, "application/json", err);
+            return;
+        }
+        // Auch ohne Error koennten 0 Presets gefunden worden sein (Speaker hat
+        // selber keinen). Das ist OK — Mock liefert dann zwar 404 weiter, aber
+        // damit ist nichts verloren. Speaker behaelt was er hat (= nichts).
+    }
+
     auto* job = new MigrateJob_{id, ip, myBaseUrl(), /*doMigrate=*/true};
     BaseType_t r = xTaskCreate(migrateRevertWorker_, "bg-migrate", 4096, job,
                                 tskIDLE_PRIORITY + 1, nullptr);
@@ -427,43 +463,40 @@ String xmlExtractTag(const String& xml, int start, int end, const String& tag) {
     return xml.substring(a, b);
 }
 
-void handleImportFromDevice(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+// Pure-Helper: holt /presets-XML vom Speaker, normalisiert + persistiert.
+// JsonDocument&-Outputs optional (nullptr fuer "kein Detail-Report noetig",
+// nur Status reicht). Return-Wert:
+//   200 = OK (countOk + countAban gesetzt)
+//   404 = unknown deviceId
+//   500 = http begin failed
+//   502 = speaker http != 200 (httpCodeOut gefuellt)
+int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
+                              int& httpCodeOut, JsonArray imported,
+                              JsonArray abandoned) {
+    countOk = countAban = 0;
+    httpCodeOut = 0;
     auto& inv = bosefix::SpeakerInventory::instance();
     String spIp;
     {
         bosefix::SpeakerInventory::LockGuard g(inv);
         auto* sp = inv.findById(id);
-        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        if (!sp) return 404;
         spIp = sp->ip;
     }
-
     HTTPClient http;
     http.setReuse(false);
     String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/presets";
     http.setConnectTimeout(2000); http.setTimeout(3000);
-    if (!http.begin(url)) {
-        req->send(500, "application/json", "{\"error\":\"http begin\"}"); return;
-    }
+    if (!http.begin(url)) return 500;
     int code = http.GET();
-    if (code != 200) {
-        http.end();
-        req->send(502, "application/json",
-                  String("{\"error\":\"speaker http ") + code + "\"}");
-        return;
-    }
+    httpCodeOut = code;
+    if (code != 200) { http.end(); return 502; }
     String xml = http.getString();
     http.end();
 
-    JsonDocument resp;
-    JsonArray imported  = resp["imported"].to<JsonArray>();
-    JsonArray abandoned = resp["abandoned"].to<JsonArray>();
-    int countOk = 0, countAban = 0;
-    int pos = 0;
-    // Sammelt alle erfolgreich normalisierten Presets, damit am Ende EIN
-    // setSlots-Aufruf statt 6 einzelner set() — 1 NVS-Write statt bis zu 6.
     std::vector<bosefix::Preset> toSet;
     toSet.reserve(6);
+    int pos = 0;
     while (true) {
         int presetOpen = xml.indexOf("<preset id=\"", pos);
         if (presetOpen < 0) break;
@@ -485,35 +518,60 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
         auto nr = bosefix::normalizePreset(src, loc, name, img, p);
 
         if (nr.status == bosefix::NormalizeStatus::ABANDONED) {
-            JsonObject o = abandoned.add<JsonObject>();
-            o["slot"]   = slot;
-            o["source"] = src;
-            o["reason"] = nr.reason;
+            if (!abandoned.isNull()) {
+                JsonObject o = abandoned.add<JsonObject>();
+                o["slot"]   = slot;
+                o["source"] = src;
+                o["reason"] = nr.reason;
+            }
             ++countAban;
         } else {
             toSet.push_back(p);
-            JsonObject o = imported.add<JsonObject>();
-            o["slot"]            = p.slot;
-            o["name"]            = p.name;
-            o["source"]          = bosefix::presetSourceToStr(p.source);
-            o["stationId"]       = p.stationId;
-            o["streamUrl"]       = p.streamUrl;
-            o["normalize"]       = bosefix::normalizeStatusToStr(nr.status);
-            if (nr.status == bosefix::NormalizeStatus::OK_CONVERTED) {
-                o["converted_from"] = nr.originalSource;
-                o["reason"]         = nr.reason;
+            if (!imported.isNull()) {
+                JsonObject o = imported.add<JsonObject>();
+                o["slot"]            = p.slot;
+                o["name"]            = p.name;
+                o["source"]          = bosefix::presetSourceToStr(p.source);
+                o["stationId"]       = p.stationId;
+                o["streamUrl"]       = p.streamUrl;
+                o["normalize"]       = bosefix::normalizeStatusToStr(nr.status);
+                if (nr.status == bosefix::NormalizeStatus::OK_CONVERTED) {
+                    o["converted_from"] = nr.originalSource;
+                    o["reason"]         = nr.reason;
+                }
             }
             ++countOk;
         }
         pos = presetClose;
     }
-
     // Batched-Save: alle erfolgreich normalisierten Presets in einem
-    // NVS-Write statt einer pro Slot.
-    bosefix::PresetStore::instance().setSlots(id, toSet);
+    // NVS-Write statt einer pro Slot. ABER: wenn der Speaker grad leer ist
+    // (z.B. eben durch eine voraus-fehlgeschlagene Migration), setSlots-mit-
+    // leerem-vector wuerde unseren Store auch leer machen. Deshalb nur dann
+    // schreiben wenn was gefunden wurde — sonst Store unveraendert lassen.
+    if (!toSet.empty()) {
+        bosefix::PresetStore::instance().setSlots(id, toSet);
+    }
+    return 200;
+}
 
-    resp["ok"]            = true;
-    resp["count"]         = countOk;
+void handleImportFromDevice(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    JsonDocument resp;
+    JsonArray imported  = resp["imported"].to<JsonArray>();
+    JsonArray abandoned = resp["abandoned"].to<JsonArray>();
+    int countOk = 0, countAban = 0, httpCode = 0;
+    int status = importPresetsFromSpeaker_(id, countOk, countAban, httpCode,
+                                            imported, abandoned);
+    if (status == 404) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+    if (status == 500) { req->send(500, "application/json", "{\"error\":\"http begin\"}");      return; }
+    if (status == 502) {
+        req->send(502, "application/json",
+                  String("{\"error\":\"speaker http ") + httpCode + "\"}");
+        return;
+    }
+    resp["ok"]              = true;
+    resp["count"]           = countOk;
     resp["abandoned_count"] = countAban;
     String body; serializeJson(resp, body);
     req->send(200, "application/json", body);
@@ -538,6 +596,13 @@ void pushPresetWorker_(void* arg) {
     String url = "http://" + job->spIp + ":" + String(BOSE_BMX_PORT) + "/select";
     int selectCode = -1;
     if (http.begin(url)) {
+        // sourceAccount muss zum Speaker-/sources-Eintrag passen, sonst HTTP 500:
+        //   TUNEIN -> "TuneIn" (Greta+Emma+Kueche haben das so unter sourceItem
+        //             source="TUNEIN" sourceAccount="TuneIn" gespeichert).
+        //   LOCAL_INTERNET_RADIO -> "" (das ist der ESP-eigene Stream-Proxy,
+        //             Speaker akzeptiert leeren Account).
+        const char* srcAcct =
+            (job->p.source == bosefix::PresetSource::TUNEIN) ? "TuneIn" : "";
         String ci = "<ContentItem source=\"";
         ci += bosefix::presetSourceToStr(job->p.source);
         ci += "\" type=\"stationurl\" location=\"";
@@ -546,7 +611,8 @@ void pushPresetWorker_(void* arg) {
         } else {
             ci += job->p.streamUrl;
         }
-        ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + job->p.name + "</itemName></ContentItem>";
+        ci += "\" sourceAccount=\""; ci += srcAcct;
+        ci += "\" isPresetable=\"true\"><itemName>" + job->p.name + "</itemName></ContentItem>";
         http.addHeader("Content-Type", "text/xml");
         selectCode = http.POST(ci);
         http.end();
@@ -862,6 +928,77 @@ void handlePutAutoMode(AsyncWebServerRequest* req, JsonDocument& body) {
     req->send(200, "application/json", b);
 }
 
+// -----------------------------------------------------------------------------
+// P2 — Event-Capture / Now-Playing-UI.
+//   GET  /api/events                       — all devices, latest now-playing per
+//   GET  /api/speaker/{deviceId}/now-playing  — single device
+//   GET  /api/speaker/{deviceId}/events       — last 20 event-types per device
+//   DELETE /api/events                     — clear all
+// -----------------------------------------------------------------------------
+void handleEventsAll(AsyncWebServerRequest* req) {
+    JsonDocument doc;
+    JsonArray arr = doc["devices"].to<JsonArray>();
+    bosefix::eventStoreAllDevicesJson(arr);
+    doc["count"] = arr.size();
+    bosefix::EventStoreStats st = bosefix::eventStoreStats();
+    JsonObject stats = doc["stats"].to<JsonObject>();
+    stats["chunks_seen"]      = st.chunks_seen;
+    stats["bodies_completed"] = st.bodies_completed;
+    stats["parse_errors"]     = st.parse_errors;
+    stats["events_ingested"]  = st.events_ingested;
+    stats["last_chunk_ms"]    = st.last_chunk_ms;
+    stats["last_body_ms"]     = st.last_body_ms;
+    stats["last_chunk_age_ms"] = st.last_chunk_ms ? (long)(millis() - st.last_chunk_ms) : -1L;
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handleNowPlaying(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    JsonDocument doc;
+    JsonObject now = doc["now"].to<JsonObject>();
+    bosefix::eventStoreNowPlayingJson(id, now);
+    doc["device_id"] = id;
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handleSpeakerEvents(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    JsonDocument doc;
+    JsonArray arr = doc["events"].to<JsonArray>();
+    bosefix::eventStoreEventsJson(id, arr);
+    doc["device_id"] = id;
+    doc["count"]     = arr.size();
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handleEventsClear(AsyncWebServerRequest* req) {
+    bosefix::eventStoreClearAll();
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// -----------------------------------------------------------------------------
+// GET /api/unknown-requests — Catch-All-Logger Ringbuffer-Inhalt (P3).
+// DELETE /api/unknown-requests — leert den Ringbuffer.
+// -----------------------------------------------------------------------------
+void handleUnknownRequestsGet(AsyncWebServerRequest* req) {
+    JsonDocument doc;
+    JsonArray arr = doc["requests"].to<JsonArray>();
+    getUnknownRequestsJson(arr);
+    doc["count"]    = arr.size();
+    doc["capacity"] = 50;
+    doc["uptime_ms"] = millis();
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handleUnknownRequestsClear(AsyncWebServerRequest* req) {
+    clearUnknownRequests();
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
 void registerApiEndpoints(AsyncWebServer& ui) {
     // Statische Assets aus LittleFS (CSS, JS, etc.)
     ui.serveStatic("/assets/", LittleFS, "/assets/").setCacheControl("max-age=600");
@@ -897,6 +1034,14 @@ void registerApiEndpoints(AsyncWebServer& ui) {
 
     ui.on("/api/factory_reset_wifi", HTTP_POST, handleFactoryResetWifi);
     ui.on("/api/reboot",             HTTP_POST, handleSelfReboot);
+
+    ui.on("/api/unknown-requests",   HTTP_GET,    handleUnknownRequestsGet);
+    ui.on("/api/unknown-requests",   HTTP_DELETE, handleUnknownRequestsClear);
+
+    ui.on("/api/events",                                   HTTP_GET,    handleEventsAll);
+    ui.on("/api/events",                                   HTTP_DELETE, handleEventsClear);
+    ui.on("^/api/speaker/([^/]+)/now-playing$",            HTTP_GET,    handleNowPlaying);
+    ui.on("^/api/speaker/([^/]+)/events$",                 HTTP_GET,    handleSpeakerEvents);
 
     // OTA — multipart upload. Mit ASYNCWEBSERVER_REGEX=1 binden plain
     // Path-Strings ohne `^...$` als Prefix — /api/ota wuerde dann auch

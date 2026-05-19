@@ -1,10 +1,12 @@
 # BoseFix32 Partition Table — 4 MB Flash (ESP32-C3 / ESP32-C6 / kleine S3)
 # OTA-Pair: app0 + app1 fuer A/B-OTA-Updates
-# spiffs   → LittleFS fuer Web-UI + Mock-Templates + Cache (~640 KB reicht)
+# spiffs   → LittleFS fuer Web-UI + Mock-Templates + Cache
+# 2026-05-19: app-Slots von 0x1B0000 -> 0x1C0000 vergroessert (1.77MB->1.83MB),
+#             spiffs auf 0x60000 (384 KB) verkleinert. data/ braucht <50 KB.
 # Name,    Type, SubType,  Offset,   Size,    Flags
 nvs,      data, nvs,      0x9000,   0x5000,
 otadata,  data, ota,      0xe000,   0x2000,
-app0,     app,  ota_0,    0x10000,  0x1B0000,
-app1,     app,  ota_1,    0x1C0000, 0x1B0000,
-spiffs,   data, spiffs,   0x370000, 0x80000,
+app0,     app,  ota_0,    0x10000,  0x1C0000,
+app1,     app,  ota_1,    0x1D0000, 0x1C0000,
+spiffs,   data, spiffs,   0x390000, 0x60000,
 coredump, data, coredump, 0x3F0000, 0x10000,

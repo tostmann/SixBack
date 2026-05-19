@@ -7,9 +7,9 @@
 #define FW_NAME           "BoseFix32"
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  4
-#define FW_VERSION_BUILD  319
+#define FW_VERSION_BUILD  364
 
-#define FW_VERSION_STRING "0.4.319"
-#define FW_BUILD_DATE     "2026-05-18 19:49:50"
+#define FW_VERSION_STRING "0.4.364"
+#define FW_BUILD_DATE     "2026-05-19 16:34:54"
 
 #endif // BOSEFIX32_VERSION_H

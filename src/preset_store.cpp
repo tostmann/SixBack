@@ -281,6 +281,16 @@ bool PresetStore::findByStationId(const String& stationId, Preset& out) {
     return false;
 }
 
+bool PresetStore::hasAnyFor(const String& deviceId) {
+    LockGuard g(*this);
+    auto* s = find_(deviceId);
+    if (!s) return false;
+    for (int i = 0; i < 6; ++i) {
+        if (s->slots[i].source != PresetSource::EMPTY) return true;
+    }
+    return false;
+}
+
 String PresetStore::toBoseXml(const String& deviceId) {
     LockGuard g(*this);
     // Format aus Pre-Migration-Snapshot der Bose Cloud:
@@ -304,7 +314,13 @@ String PresetStore::toBoseXml(const String& deviceId) {
             } else {
                 out += xmlEscape_(p.streamUrl);
             }
-            out += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>";
+            // sourceAccount muss zum /sources-Eintrag am Speaker passen. Bei
+            // TUNEIN ist das "TuneIn" (so kommt es auch im Bose-Werks-Cloud-
+            // Sync). Leerer sourceAccount fuehrt am Speaker zu HTTP 500
+            // "UNKNOWN_SOURCE_ERROR" beim /select.
+            out += "\" sourceAccount=\"";
+            out += (p.source == PresetSource::TUNEIN) ? "TuneIn" : "";
+            out += "\" isPresetable=\"true\"><itemName>";
             out += xmlEscape_(p.name);
             out += "</itemName>";
             if (p.imageUrl.length() > 0) {

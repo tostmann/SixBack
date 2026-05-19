@@ -28,9 +28,9 @@ keine alten Image-Defaults / NVS-Werte das Ergebnis fälschen.
 | Phase | Target | Provisioning | Erwartung |
 |-------|--------|--------------|-----------|
 | 1     | S3     | **Improv-Serial** | Alle Speaker werden vom S3 entdeckt + migriert. |
-| 2     | C6     | **Captive-Portal** | Alle Speaker werden vom C6 auto-claimed weg vom S3 + migriert auf C6. |
+| 2     | C6     | **Improv-Serial** (ab 2026-05-19, vorher Captive) | Alle Speaker werden vom C6 auto-claimed weg vom S3 + migriert auf C6. |
 | 3     | S3     | **Improv-Serial** | Alle Speaker werden vom S3 zurück-migriert. |
-| 4     | C6     | **Captive-Portal** | Alle Speaker werden vom C6 zurück-migriert. |
+| 4     | C6     | **Improv-Serial** (ab 2026-05-19, vorher Captive) | Alle Speaker werden vom C6 zurück-migriert. |
 
 Diese Alternation deckt:
 
@@ -177,12 +177,12 @@ Pass-Kriterien pro Phase:
 ```bash
 # Phase 1 — S3 via Improv
 ENV="s3";  PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C37280229-if00";   PROVISION="improv"; LAN_IP="10.10.11.169"
-# Phase 2 — C6 via Captive
-ENV="c6";  PORT="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_54:32:04:03:59:68-if00"; PROVISION="captive"; AP_SSID="BoseFix32-035968"; LAN_IP="10.10.11.168"
+# Phase 2 — C6 via Improv (ab 2026-05-19)
+ENV="c6";  PORT="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_54:32:04:03:59:68-if00"; PROVISION="improv"; LAN_IP="10.10.11.168"
 # Phase 3 — S3 via Improv
 ENV="s3";  PORT="...wie Phase 1...";  PROVISION="improv";  LAN_IP="10.10.11.169"
-# Phase 4 — C6 via Captive
-ENV="c6";  PORT="...wie Phase 2...";  PROVISION="captive"; AP_SSID="BoseFix32-035968"; LAN_IP="10.10.11.168"
+# Phase 4 — C6 via Improv (ab 2026-05-19)
+ENV="c6";  PORT="...wie Phase 2...";  PROVISION="improv";  LAN_IP="10.10.11.168"
 ```
 
 ## Bekannte Erwartungs-Abweichungen
@@ -195,6 +195,35 @@ ENV="c6";  PORT="...wie Phase 2...";  PROVISION="captive"; AP_SSID="BoseFix32-03
 ## Ergebnis-Protokoll
 
 Pro Release einen Block hier anhängen mit Datum + Version + Phase-Ergebnissen:
+
+### 2026-05-19 — vor v0.5.0-Release (Source-Stand: master `bd0c9ec` Preset-Loss-Fix)
+
+**Aenderung im Test-Setup:** Captive-Phasen ENTFALLEN — alle 4 Phasen
+laufen jetzt via Improv-Serial. Hintergrund: `wlan0` auf Pi5/genai ist
+per `oct-unmanage-wlan0.conf` unmanaged; Captive-Workaround via
+`wpa_supplicant`+`dhcpcd` funktionierte zwar, ist aber fragil. Beide
+Targets (S3 CH343, C6 USB-Serial-JTAG) sprechen Improv ueber USB-CDC.
+
+| Phase | Target | Prov | Erwartung | Resultat |
+|-------|--------|------|-----------|----------|
+|   1   | S3 (v0.4.355, 10.10.11.169) | Improv | erase → claim 3 Speaker C6→S3 | **PASS** — 2/3 via SSDP Auto-Mode, Küche cold-start-Lücke → manuell `addByIp`+`migrate`. Presets 6/6/6 erhalten. |
+|   2   | C6 (v0.4.357, 10.10.11.168) | Improv | erase → Migration 3 Speaker S3→C6 | **PASS** — Auto-Mode-Erst-Pass: 2 seen 0 migrated wegen `preset import failed` (Speaker race). Manual migrate-trigger nach Reset → 3/3 OK, pre-import-fix `bd0c9ec` aktiv: Speaker behielten Presets durchgehend. **Port-80-Hang** nach 9 min Monitoring — DTR-Reset normalisierte. |
+|   3   | S3 (v0.4.360, 10.10.11.169) | Improv | erase → Migration 3 Speaker C6→S3 | **PASS** — Auto-Mode 2/3 + manual 1/3 (Küche), Presets durchgängig 6/6/6 (transiente 0 während Speaker-Reboot, sofort wieder 6 nach back-online). |
+|   4   | C6 (v0.4.363, 10.10.11.168) | Improv | erase → Migration 3 Speaker S3→C6 | **PASS** — Auto-Mode 2/3 (Küche cold) + manual 1/3, alle Presets 6/6/6. **Port-80-Hang** nach Auto-Mode → DTR-Reset. Improv-Tool meldet bei ~25% der Versuche "Unable to connect to WiFi" obwohl C6 dann doch im LAN ist — 2. Versuch direkt nach Reset klappt zuverlässig. |
+
+**Gesamt:** 4/4 Phasen bestanden, **kein Preset-Verlust mehr** dank Fix
+`bd0c9ec` (Defense-in-Depth: handleMigrate Pre-Import + handleDevicePresets
+404 + handleAccountFull skip-empty). Heap min_free auf C6 142-149 KB, auf
+S3 128 KB → komfortabel ueber den Pass-Kriterien (50/80 KB).
+
+**Quirks 2026-05-19 (geegenueber 2026-05-18 unverändert):**
+- HTTP-Port-80-Hang nach Auto-Mode (Lesson #36)
+- SSDP-Cold-Start-Lücke fuer Küche (Lesson #33)
+- Improv-Tool "Unable to connect" False-Negatives (neu beobachtet — geringe Häufigkeit, retry hilft)
+
+**Captive-Phasen ENTFALLEN — Improv für alle 4 Phasen.**
+
+---
 
 ### 2026-05-18 — vor v0.4.0-Release (Source-Stand: master 1e8929c + post-review-fixes)
 

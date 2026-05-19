@@ -21,6 +21,7 @@
 #include "version.h"
 #include "bose_endpoints.h"
 #include "api_endpoints.h"
+#include "event_store.h"
 #include "wifi_provisioning.h"
 #include "speaker_inventory.h"
 #include "preset_store.h"
@@ -77,6 +78,7 @@ static void startMDNS() {
 }
 
 static void startBoseServer() {
+    bosefix::eventStoreInit();
     registerBoseEndpoints(boseServer);
     boseServer.begin();
     Serial.printf("[bose] cloud-replacement listening on :%d\n", BOSE_HTTP_PORT);

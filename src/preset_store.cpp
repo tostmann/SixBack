@@ -2,6 +2,7 @@
 #include "preset_store.h"
 #include "nvs_helper.h"
 #include "speaker_inventory.h"
+#include "tunein_resolver.h"   // tuneInLogoUrl() — kanonische TuneIn-Logo-URL
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
 #include <vector>
@@ -112,7 +113,16 @@ void PresetStore::loadFromNVS() {
             p.name        = (const char*)(pj["name"]      | "");
             p.stationId   = (const char*)(pj["stationId"] | "");
             p.streamUrl   = (const char*)(pj["streamUrl"] | "");
-            p.imageUrl    = (const char*)(pj["imageUrl"]  | "");
+            // Gegenstueck zur Sparmassnahme in saveToNVS(): ein FEHLENDES
+            // imageUrl-Feld heisst bei TUNEIN "war die kanonische Logo-URL"
+            // -> rekonstruieren. Ein VORHANDENES Feld (auch ein leeres) wird
+            // unveraendert uebernommen, damit "bewusst kein Cover" und alle
+            // Daten aus Firmwares VOR diesem Fix unveraendert bleiben.
+            if (pj["imageUrl"].isNull() && p.source == PresetSource::TUNEIN) {
+                p.imageUrl = tuneInLogoUrl(p.stationId);
+            } else {
+                p.imageUrl = (const char*)(pj["imageUrl"] | "");
+            }
             p.rawContentItem   = (const char*)(pj["rawContentItem"]   | "");
             p.opaqueSourceName = (const char*)(pj["opaqueSourceName"] | "");
         }
@@ -148,8 +158,34 @@ bool PresetStore::saveToNVS() {
             pj["source"]    = presetSourceToStr(p.source);
             pj["name"]      = p.name;
             pj["stationId"] = p.stationId;
-            pj["streamUrl"] = p.streamUrl;
-            pj["imageUrl"]  = p.imageUrl;
+            // --- NVS-Sparmassnahme fuer TUNEIN (Lab-Messung 2026-07-30) -----
+            // Die NVS-Partition hat 630 Entries fuer ALLES (WiFi, Inventar,
+            // Store, Spotify, ...). Gemessen: ein TUNEIN-Preset MIT beiden URLs
+            // kostet ~6 Entries, ohne sie ~1 — die Store-Kante lag bei
+            // 5 Speakern (volle Presets) gegenueber >22 (schlanke).
+            //
+            // streamUrl ist bei TUNEIN funktional bedeutungslos: jeder
+            // Konsument verzweigt vorher auf stationId und baut die location
+            // selbst ("/v1/playback/station/" + stationId) — buildDevicePresets_
+            // hier, der Zwilling in bose_endpoints.cpp, die Push-Pipeline, und
+            // im HW-Preset-Vergleich liegt der streamUrl-Vergleich
+            // ausschliesslich im LOCAL_INTERNET_RADIO-Zweig.
+            // NUR die Persistenz wird schlank — exportJson() bleibt absichtlich
+            // vollstaendig, damit ein Export/Backup selbsttragend ist.
+            if (p.source != PresetSource::TUNEIN) {
+                pj["streamUrl"] = p.streamUrl;
+            }
+            // imageUrl WIRD gebraucht (<containerArt>), ist bei TUNEIN aber
+            // meist exakt die kanonische Logo-URL zur stationId. Nur die wird
+            // weggelassen und beim Laden rekonstruiert — jede abweichende URL
+            // (eigenes Cover, anderes Format, Cache-Buster) bleibt gespeichert.
+            // "Bewusst leer" bleibt erhalten: ein leeres Feld wird geschrieben,
+            // nur ein FEHLENDES gilt beim Laden als "kanonisch rekonstruieren".
+            if (!(p.source == PresetSource::TUNEIN &&
+                  p.imageUrl.length() > 0 &&
+                  p.imageUrl == tuneInLogoUrl(p.stationId))) {
+                pj["imageUrl"] = p.imageUrl;
+            }
             if (p.source == PresetSource::OPAQUE) {
                 pj["rawContentItem"]   = p.rawContentItem;
                 pj["opaqueSourceName"] = p.opaqueSourceName;

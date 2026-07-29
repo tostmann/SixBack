@@ -28,6 +28,13 @@ struct TuneInResolution {
 
 TuneInResolution resolveTuneInStruct(const String& stationId);
 
+// Kanonische TuneIn-Logo-URL zu einer stationId — EINZIGE Quelle fuer dieses
+// Muster. PresetStore::saveToNVS laesst eine imageUrl, die exakt hier heraus-
+// kommt, beim Persistieren WEG und rekonstruiert sie beim Laden (spart NVS).
+// Wird das Muster hier geaendert, aendert sich damit auch die Rekonstruktion
+// bereits gespeicherter Presets — nur mit Bedacht anfassen.
+String tuneInLogoUrl(const String& stationId);
+
 // Loescht den kompletten Resolve-Cache (NVS-Namespace sixback-tune).
 void clearTuneInCache();
 

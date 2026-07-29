@@ -214,7 +214,16 @@ write_manifest() {
   fi
 }
 
-# --- 3a) Fresh-install manifest (full factory write + erase) -------------
+# --- 3a) Fresh-install manifest (full factory write) ----------------------
+# "name" ist hier absichtlich ebenfalls FW_NAME: das factory-Image wird an
+# 0x0 geschrieben und bringt Bootloader + Partitionstabelle + App + FS
+# komplett mit, ein vorheriges eraseFlash() ist dafuer nicht noetig.
+# Folge (bekannt, nicht behoben): laeuft auf dem Board schon SixBack und
+# ist das Improv-Fenster offen, greift esp-web-tools' _isSameFirmware und
+# es wird OHNE erase geflasht -> die NVS-Partition @0x9000 ueberlebt auf
+# Targets, deren factory-Image sie nicht ueberdeckt (S3). Auf C3/C6 liegt
+# NVS im Image und wird mitgeschrieben. Der Landing-Page-Text traegt dem
+# Rechnung ("ueberschreibt die Firmware" statt "loescht alles").
 write_manifest "$OUT/manifest.json" <<EOF
 {
   "name": "SixBack",
@@ -257,20 +266,36 @@ write_manifest "$OUT/manifest.json" <<EOF
 EOF
 
 # --- 3b) Update manifest (no erase; firmware + spiffs only, NVS bleibt) --
-# Beim Update-Manifest schreibt esp-web-tools nur die Parts an ihren
-# Offsets, OHNE vorher Flash zu erasen. NVS-Partition @ 0x9000 (WiFi-Creds,
-# Speaker-Inventory, Preset-Store, Spotify-Auth + Slot-Mappings) bleibt.
-#
 # Offsets MUESSEN zur Partition-Tabelle des jeweiligen Targets passen:
 #   esp32 / s3 / c3 / c6: app/app0 @ 0x10000
 #   esp32 / c3 / c6:      spiffs   @ 0x3B0000  (partitions-4mb.csv)
 #   s3:                   spiffs   @ 0x610000  (partitions.csv)
+#
+# ⚠️ "name" MUSS exakt FW_NAME aus src/version.h sein ("SixBack") — sonst
+# loescht dieses Manifest das Geraet, statt es zu aktualisieren.
+# esp-web-tools entscheidet in install-dialog.ts so:
+#
+#   if (_isSameFirmware)              _startInstall(false);  // kein erase
+#   else if (new_install_prompt_erase) ASK_ERASE;            // fragt nach
+#   else                               _startInstall(true);  // eraseFlash()!
+#
+# und _isSameFirmware ist ein EXAKTER String-Vergleich des per Improv
+# gemeldeten Firmware-Namens gegen manifest.name. Der fruehere Wert
+# "SixBack (update)" hat nie gematcht -> dritter Zweig -> voller
+# eraseFlash() vor dem Schreiben, und da dieses Manifest KEINEN Bootloader
+# (@0x0) enthaelt, bliebe ein nicht bootendes Geraet zurueck.
+#
+# new_install_prompt_erase heisst NICHT "erasen?", sondern "vorher FRAGEN?".
+# Deshalb hier true: greift nur, wenn das Improv-Fenster des Geraets schon
+# zu ist (dann kennt esp-web-tools den Firmware-Namen nicht). Die Checkbox
+# im Dialog ist per Default NICHT angehakt -> auch dieser Pfad erased nicht,
+# solange der User es nicht ausdruecklich will.
 write_manifest "$OUT/manifest-update.json" <<EOF
 {
-  "name": "SixBack (update)",
+  "name": "SixBack",
   "version": "$VERSION",
   "funding_url": "https://paypal.me/busware",
-  "new_install_prompt_erase": false,
+  "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
@@ -336,12 +361,15 @@ write_manifest "$OUT/manifest-s3-8mb.json" <<EOF
 }
 EOF
 
+# "name" wie bei 3b exakt FW_NAME — siehe die Begruendung dort. Die
+# 8-MB-Unterscheidung traegt der Button auf der Landing-Page, nicht der
+# Manifest-Name; esp-web-tools waehlt den Build ohnehin nur per chipFamily.
 write_manifest "$OUT/manifest-update-s3-8mb.json" <<EOF
 {
-  "name": "SixBack (S3 8MB update)",
+  "name": "SixBack",
   "version": "$VERSION",
   "funding_url": "https://paypal.me/busware",
-  "new_install_prompt_erase": false,
+  "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-S3",

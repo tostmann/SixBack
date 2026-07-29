@@ -157,11 +157,17 @@ bool fetchFromOpml(const String& id, String& url, String& name, String& image) {
         http.end();
     }
     if (image.length() == 0)
-        image = "https://cdn-profiles.tunein.com/" + id + "/images/logoq.png";
+        image = tuneInLogoUrl(id);
     return true;
 }
 
 } // anon
+
+// Kanonische Logo-URL. Deklaration + Begruendung siehe tunein_resolver.h.
+String tuneInLogoUrl(const String& stationId) {
+    if (stationId.length() == 0) return String();
+    return "https://cdn-profiles.tunein.com/" + stationId + "/images/logoq.png";
+}
 
 // Loescht den gesamten TuneIn-Resolve-Cache (NVS-Namespace sixback-tune).
 // Noetig nach einem Resolver-Verhaltenswechsel (z.B. dem formats=-Fix):
@@ -275,7 +281,7 @@ TuneInResolution resolveTuneInStruct(const String& stationId) {
         if (stationId == kFallback[i].id) {
             r.name      = kFallback[i].name;
             r.streamUrl = kFallback[i].url;
-            r.imageUrl  = "https://cdn-profiles.tunein.com/" + stationId + "/images/logoq.png";
+            r.imageUrl  = tuneInLogoUrl(stationId);
             r.source    = "fallback";
             r.ok        = true;
             return r;

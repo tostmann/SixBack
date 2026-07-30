@@ -3226,12 +3226,14 @@ void handleTuneInResolve(AsyncWebServerRequest* req) {
     req->send(200, "application/json", b);
 }
 
-// POST /api/tunein/cache/clear — verwirft den NVS-Resolve-Cache (sixback-tune)
-// komplett. Noetig nach einem Resolver-Verhaltenswechsel, damit Stations, die
-// vorher als notcompatible-Platzhalter gecached wurden, neu aufgeloest werden.
+// POST /api/tunein/cache/clear — verwirft den Resolve-Cache komplett
+// (LittleFS /tcache/*.json + Legacy-NVS-Namespace aus Zeiten vor dem
+// FS-Umzug). Noetig nach einem Resolver-Verhaltenswechsel, damit Stations,
+// die vorher als notcompatible-Platzhalter gecached wurden, neu aufgeloest
+// werden.
 void handleTuneInCacheClear(AsyncWebServerRequest* req) {
     sixback::clearTuneInCache();
-    req->send(200, "application/json", "{\"ok\":true,\"cleared\":\"sixback-tune\"}");
+    req->send(200, "application/json", "{\"ok\":true,\"cleared\":\"tunein-cache\"}");
 }
 
 // GET /api/tunein/search?q=...

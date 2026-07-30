@@ -5,6 +5,7 @@
 #include "config.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <LittleFS.h>
 #include <WiFi.h>
 #include <vector>
 
@@ -12,15 +13,40 @@ namespace sixback {
 
 namespace {
 
+// Bis v0.8.36 lag der Resolve-Cache in DIESEM NVS-Namespace. Ein Eintrag
+// (url+name+image) kostet dort ~8 der 630 NVS-Entries, ohne Obergrenze —
+// bei vielen Speakern/Sendern laeuft die Partition damit voll, egal wie
+// schlank die Presets sind (FHEM 144729: 9 Boxen x 6 Presets = "partition
+// out of space" trotz Fresh-Install). Seit dem Umzug nach LittleFS wird
+// der Namespace nur noch beim Boot geleert (Migration, gibt die Entries
+// frei) — neue Eintraege landen hier NIE wieder.
 constexpr const char* NVS_NS = "sixback-tune";
 
-// NVS-Cache-Policy: einmal aufgeloest, ewig gueltig.
-// Ohne RTC haben wir keinen verlaesslichen Zeitbegriff (millis() resettet
-// bei jedem Boot, NTP-Anbindung ist optional). Daher: kein automatisches
-// Aging — Stale-Eintraege werden durch User-Reset/Re-Migration ersetzt.
-// Wenn ein Sender den Stream-URL wechselt, muss der User entweder Preset
-// neu setzen oder NVS-Namespace `sixback-tune` per OTA-Reset loeschen.
-// TODO: optionaler `POST /api/tunein/cache/clear`-Endpoint waere nuetzlich.
+// Cache-Policy (unveraendert): einmal aufgeloest, ewig gueltig — ohne RTC
+// kein verlaesslicher Zeitbegriff, daher kein Aging. Stale-Eintraege raeumt
+// der Versions-Sprung-Auto-Clear ab (Marker-Datei unten). Ablage: eine
+// kleine JSON-Datei je Sender unter /tcache/. Auf den 16-MB-Layouts sind
+// dort ~9,9 MB frei; auf den 256-KB-Filesystemen der 4-MB-Targets kann ein
+// Write bei vollem FS scheitern — dann faellt der Eintrag auf Cache-Miss
+// zurueck (Resolver holt ihn erneut von OPML), nichts geht kaputt.
+constexpr const char* CACHE_DIR    = "/tcache";
+constexpr const char* CACHE_VER_FN = "/tcache/__fwver";   // kein .json-Suffix
+                                                          // -> kollidiert nie
+                                                          // mit Station-Files
+
+// Sanitizing: die stationId kommt aus dem URL-Pfad des Speakers. Nur
+// harmloses Zeichenmaterial wird zum Dateinamen; alles andere ist schlicht
+// nicht cachebar (Resolver funktioniert trotzdem, nur eben ohne Cache).
+String cacheFsPath(const String& id) {
+    if (id.length() == 0 || id.length() > 48) return String();
+    for (size_t i = 0; i < id.length(); ++i) {
+        const char c = id[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                     || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return String();
+    }
+    return String(CACHE_DIR) + "/" + id + ".json";
+}
 
 // Fallback-Liste fuer "Internet weg und Cache leer" (= ganz frischer Boot
 // ohne je gelaufenen TuneIn-Resolve). Stark DACH-biased — Dirks lokale
@@ -39,8 +65,14 @@ const Fallback kFallback[] = {
 const size_t kFallbackCount = sizeof(kFallback) / sizeof(kFallback[0]);
 
 bool lookupCache(const String& id, String& url, String& name, String& image) {
+    const String path = cacheFsPath(id);
+    if (path.length() == 0) return false;
+    File f = LittleFS.open(path, "r");
+    if (!f) return false;
     JsonDocument doc;
-    if (!nvsLoadJson(NVS_NS, id.c_str(), doc)) return false;
+    const bool parsed = deserializeJson(doc, f) == DeserializationError::Ok;
+    f.close();
+    if (!parsed) return false;               // korrupt -> Miss, wird neu geholt
     url   = (const char*)(doc["url"]   | "");
     name  = (const char*)(doc["name"]  | "");
     image = (const char*)(doc["image"] | "");
@@ -48,11 +80,20 @@ bool lookupCache(const String& id, String& url, String& name, String& image) {
 }
 
 void saveCache(const String& id, const String& url, const String& name, const String& image) {
+    const String path = cacheFsPath(id);
+    if (path.length() == 0) return;
     JsonDocument doc;
     doc["url"]   = url;
     doc["name"]  = name;
     doc["image"] = image;
-    nvsSaveJson(NVS_NS, id.c_str(), doc);
+    LittleFS.mkdir(CACHE_DIR);               // no-op wenn vorhanden
+    File f = LittleFS.open(path, "w");
+    if (!f) return;                          // FS voll/RO -> kein Cache, kein Drama
+    const size_t want = measureJson(doc);
+    const size_t got  = serializeJson(doc, f);
+    f.close();
+    if (got != want) LittleFS.remove(path);  // halber Write (FS voll) -> weg damit,
+                                             // sonst laege dauerhaft Muell im Cache
 }
 
 // Prueft, ob eine Stream-URL erreichbar ist. GET, nur den Response-Code lesen,
@@ -174,6 +215,20 @@ String tuneInLogoUrl(const String& stationId) {
 // Stations, die VORHER als notcompatible-Platzhalter aufgeloest + gecached
 // wurden, sind sonst dauerhaft stale. Aufgerufen von POST /api/tunein/cache/clear.
 void clearTuneInCache() {
+    // Station-Files unter /tcache loeschen (Marker-Datei __fwver bleibt —
+    // sonst wuerde der naechste Boot den Cache gleich noch einmal leeren).
+    // Erst Namen sammeln, dann loeschen: remove() waehrend openNextFile()
+    // ist auf LittleFS nicht definiert.
+    std::vector<String> victims;
+    File dir = LittleFS.open(CACHE_DIR);
+    if (dir && dir.isDirectory()) {
+        for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+            const String n = String(f.name());
+            if (n.endsWith(".json")) victims.push_back(String(CACHE_DIR) + "/" + n);
+        }
+    }
+    for (const auto& p : victims) LittleFS.remove(p);
+    // Legacy: bis v0.8.36 lag der Cache im NVS — Namespace mit abraeumen.
     nvsEraseAllInNamespace(NVS_NS);
 }
 
@@ -181,18 +236,20 @@ void clearTuneInCache() {
 // dass ein Resolver-Verhaltenswechsel (z.B. der formats=-AAC-Fix) Stations
 // dauerhaft auf einer stale notcompatible-Aufloesung haengen laesst — der
 // Nutzer muss nach einem OTA nichts manuell triggern. Idempotent: feuert nur,
-// wenn FW_VERSION_STRING vom zuletzt gestempelten Wert abweicht. Der Marker
-// liegt im selben Namespace unter "__fwver" (kollidiert nicht mit Station-IDs
-// sXXXX und wird nie als Station nachgeschlagen); clearTuneInCache() loescht
-// ihn mit, daher danach neu stempeln.
+// wenn FW_VERSION_STRING vom zuletzt gestempelten Wert abweicht; der Marker
+// ist die Datei /tcache/__fwver. Der NVS-Legacy-Namespace wird dagegen bei
+// JEDEM Boot geleert (billig, wenn er leer ist) — damit werden auch Geraete
+// frei, deren Marker schon auf der aktuellen Version steht.
 void autoClearTuneInCacheOnVersionChange(const char* fwVersion) {
-    JsonDocument d;
+    nvsEraseAllInNamespace(NVS_NS);           // Migration: NVS-Entries freigeben
     String last;
-    if (nvsLoadJson(NVS_NS, "__fwver", d)) last = (const char*)(d["v"] | "");
+    File m = LittleFS.open(CACHE_VER_FN, "r");
+    if (m) { last = m.readString(); m.close(); }
     if (last == fwVersion) return;            // gleiche Version -> nichts tun
-    clearTuneInCache();                        // erased NVS_NS (inkl. altem __fwver)
-    JsonDocument w; w["v"] = fwVersion;
-    nvsSaveJson(NVS_NS, "__fwver", w);         // aktuelle Version neu stempeln
+    clearTuneInCache();
+    LittleFS.mkdir(CACHE_DIR);
+    File w = LittleFS.open(CACHE_VER_FN, "w");
+    if (w) { w.print(fwVersion); w.close(); }
     Serial.printf("[tunein] resolve-cache cleared on version change -> %s\n", fwVersion);
 }
 

@@ -4,10 +4,11 @@
 // Resolver-Pipeline:
 //   1. PresetStore: gibt es einen Override (streamUrl) fuer diese stationId?
 //      -> Bose-JSON-Wrapper, kein TuneIn-Call.
-//   2. NVS-Cache (Namespace sixback-tune): TTL 7 Tage.
+//   2. LittleFS-Cache (/tcache/<id>.json; bis v0.8.36 im NVS — dort kostete
+//      ein Sender ~8 der 630 Entries und lief die Partition voll).
 //      -> Cache-Hit -> JSON sofort aus Cache.
 //   3. HTTP-GET zu http://opml.radiotime.com/Tune.ashx?id=<id>&render=json
-//      -> Stream-URL extrahieren, in NVS cachen, JSON bauen.
+//      -> Stream-URL extrahieren, in LittleFS cachen, JSON bauen.
 //   4. Hardcoded-Fallback fuer die 6 Dirk-Stations (Notnagel wenn
 //      Internet weg oder TuneIn-API tot ist).
 #ifndef BOSEFIX32_TUNEIN_RESOLVER_H
@@ -35,7 +36,8 @@ TuneInResolution resolveTuneInStruct(const String& stationId);
 // bereits gespeicherter Presets — nur mit Bedacht anfassen.
 String tuneInLogoUrl(const String& stationId);
 
-// Loescht den kompletten Resolve-Cache (NVS-Namespace sixback-tune).
+// Loescht den kompletten Resolve-Cache (LittleFS /tcache/*.json + den
+// Legacy-NVS-Namespace sixback-tune aus Zeiten vor dem FS-Umzug).
 void clearTuneInCache();
 
 // Leert den Resolve-Cache EINMAL pro Firmware-Versionssprung (idempotent).

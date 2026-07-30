@@ -57,8 +57,8 @@ fi
 # partitions-4mb.csv. Followup umgesetzt: scripts/fs_exclude_esp32.py strippt
 # silence.mp3 (Spotify-only, ~120 KB) NUR fuer env:esp32 aus dem FS-Image
 # (PROJECT_DATA_DIR -> gefilterte Staging-Kopie). Damit passt esp32 wieder rein.
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32 -t buildfs
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e c5-16mb -e esp32 -t buildfs
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e c5-16mb -e esp32
 
 # Resolve final version: tag if set, else read the core from version.h.
 # Dev FW_VERSION_STRING carries a "+<counter>" suffix (e.g. "0.8.4+1116");
@@ -120,6 +120,9 @@ check_size "$PIO_BUILD/s3/firmware.bin"    $APP_16MB      "s3 app"
 check_size "$PIO_BUILD/s3/littlefs.bin"    $FS_16MB       "s3 fs"
 check_size "$PIO_BUILD/s3-8mb/firmware.bin" $APP_8MB      "s3-8mb app"
 check_size "$PIO_BUILD/s3-8mb/littlefs.bin" $FS_8MB       "s3-8mb fs"
+# C5-16MB (N16R8): gleiches 16-MB-Layout wie s3 (partitions.csv).
+check_size "$PIO_BUILD/c5-16mb/firmware.bin" $APP_16MB    "c5-16mb app"
+check_size "$PIO_BUILD/c5-16mb/littlefs.bin" $FS_16MB     "c5-16mb fs"
 
 if [ "$size_errors" -gt 0 ]; then
   echo >&2
@@ -198,198 +201,35 @@ PYTHONPATH="$C5_ESPTOOL_PKG" "$HOME/.platformio/penv/bin/python" -m esptool --ch
 cp "$PIO_BUILD/c5/firmware.bin"  "$OUT/sixback-c5-firmware.bin"
 cp "$PIO_BUILD/c5/littlefs.bin"  "$OUT/sixback-c5-littlefs.bin"
 
-# --- 3) Manifest-Writer: atomar + fsync (NFS-Regel) -----------------------
-# webflasher/ liegt auf NFS — nackte cat-Redirects koennen dem nachgelagerten
-# rsync intermittierend NUL-praefixierte Bloecke zeigen (gleiche Signatur wie
-# die gzip-/COMMIT_EDITMSG-Vorfaelle 2026-05-28, vgl. version_bump.py::
-# _atomic_write). Daher: tmp + sync + mv, danach JSON-Validierung.
-write_manifest() {
-  local dst="$1"
-  cat > "$dst.tmp"
-  sync "$dst.tmp"
-  mv "$dst.tmp" "$dst"
-  if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$dst"; then
-    echo "ABORT: $dst ist kein valides JSON (NFS-Korruption?)" >&2
-    exit 2
-  fi
-}
+# c5-16mb (N16R8, PSRAM): gleiche C5-Spezifika (bootloader@0x2000, esptool>=5),
+# aber 16-MB-Layout -> spiffs @ 0x610000 (partitions.csv, wie s3).
+echo ">>> Merging c5-16mb (esp32c5, 16MB, boot@0x2000, spiffs@0x610000) via $(basename "$C5_ESPTOOL_PKG")"
+PYTHONPATH="$C5_ESPTOOL_PKG" "$HOME/.platformio/penv/bin/python" -m esptool --chip esp32c5 merge_bin \
+  -o "$OUT/sixback-c5-16mb-factory.bin" \
+  --flash_mode dio --flash_size 16MB --flash_freq 80m \
+  0x2000   "$PIO_BUILD/c5-16mb/bootloader.bin" \
+  0x8000   "$PIO_BUILD/c5-16mb/partitions.bin" \
+  0x10000  "$PIO_BUILD/c5-16mb/firmware.bin" \
+  0x610000 "$PIO_BUILD/c5-16mb/littlefs.bin"
+cp "$PIO_BUILD/c5-16mb/firmware.bin"  "$OUT/sixback-c5-16mb-firmware.bin"
+cp "$PIO_BUILD/c5-16mb/littlefs.bin"  "$OUT/sixback-c5-16mb-littlefs.bin"
 
-# --- 3a) Fresh-install manifest (full factory write) ----------------------
-# "name" ist hier absichtlich ebenfalls FW_NAME: das factory-Image wird an
-# 0x0 geschrieben und bringt Bootloader + Partitionstabelle + App + FS
-# komplett mit, ein vorheriges eraseFlash() ist dafuer nicht noetig.
-# Folge (bekannt, nicht behoben): laeuft auf dem Board schon SixBack und
-# ist das Improv-Fenster offen, greift esp-web-tools' _isSameFirmware und
-# es wird OHNE erase geflasht -> die NVS-Partition @0x9000 ueberlebt auf
-# Targets, deren factory-Image sie nicht ueberdeckt (S3). Auf C3/C6 liegt
-# NVS im Image und wird mitgeschrieben. Der Landing-Page-Text traegt dem
-# Rechnung ("ueberschreibt die Firmware" statt "loescht alles").
-write_manifest "$OUT/manifest.json" <<EOF
-{
-  "name": "SixBack",
-  "version": "$VERSION",
-  "funding_url": "https://paypal.me/busware",
-  "new_install_prompt_erase": true,
-  "builds": [
-    {
-      "chipFamily": "ESP32",
-      "parts": [
-        { "path": "sixback-esp32-factory.bin", "offset": 0 }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-S3",
-      "parts": [
-        { "path": "sixback-s3-factory.bin", "offset": 0 }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-C3",
-      "parts": [
-        { "path": "sixback-c3-factory.bin", "offset": 0 }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-C6",
-      "parts": [
-        { "path": "sixback-c6-factory.bin", "offset": 0 }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-C5",
-      "parts": [
-        { "path": "sixback-c5-factory.bin", "offset": 0 }
-      ]
-    }
-  ]
-}
-EOF
-
-# --- 3b) Update manifest (no erase; firmware + spiffs only, NVS bleibt) --
-# Offsets MUESSEN zur Partition-Tabelle des jeweiligen Targets passen:
-#   esp32 / s3 / c3 / c6: app/app0 @ 0x10000
-#   esp32 / c3 / c6:      spiffs   @ 0x3B0000  (partitions-4mb.csv)
-#   s3:                   spiffs   @ 0x610000  (partitions.csv)
-#
-# ⚠️ "name" MUSS exakt FW_NAME aus src/version.h sein ("SixBack") — sonst
-# loescht dieses Manifest das Geraet, statt es zu aktualisieren.
-# esp-web-tools entscheidet in install-dialog.ts so:
-#
-#   if (_isSameFirmware)              _startInstall(false);  // kein erase
-#   else if (new_install_prompt_erase) ASK_ERASE;            // fragt nach
-#   else                               _startInstall(true);  // eraseFlash()!
-#
-# und _isSameFirmware ist ein EXAKTER String-Vergleich des per Improv
-# gemeldeten Firmware-Namens gegen manifest.name. Der fruehere Wert
-# "SixBack (update)" hat nie gematcht -> dritter Zweig -> voller
-# eraseFlash() vor dem Schreiben, und da dieses Manifest KEINEN Bootloader
-# (@0x0) enthaelt, bliebe ein nicht bootendes Geraet zurueck.
-#
-# new_install_prompt_erase heisst NICHT "erasen?", sondern "vorher FRAGEN?".
-# Deshalb hier true: greift nur, wenn das Improv-Fenster des Geraets schon
-# zu ist (dann kennt esp-web-tools den Firmware-Namen nicht). Die Checkbox
-# im Dialog ist per Default NICHT angehakt -> auch dieser Pfad erased nicht,
-# solange der User es nicht ausdruecklich will.
-write_manifest "$OUT/manifest-update.json" <<EOF
-{
-  "name": "SixBack",
-  "version": "$VERSION",
-  "funding_url": "https://paypal.me/busware",
-  "new_install_prompt_erase": true,
-  "builds": [
-    {
-      "chipFamily": "ESP32",
-      "parts": [
-        { "path": "sixback-esp32-firmware.bin", "offset": 65536    },
-        { "path": "sixback-esp32-littlefs.bin", "offset": 3866624  }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-S3",
-      "parts": [
-        { "path": "sixback-s3-firmware.bin",    "offset": 65536    },
-        { "path": "sixback-s3-littlefs.bin",    "offset": 6356992  }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-C3",
-      "parts": [
-        { "path": "sixback-c3-firmware.bin",    "offset": 65536    },
-        { "path": "sixback-c3-littlefs.bin",    "offset": 3866624  }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-C6",
-      "parts": [
-        { "path": "sixback-c6-firmware.bin",    "offset": 65536    },
-        { "path": "sixback-c6-littlefs.bin",    "offset": 3866624  }
-      ]
-    },
-    {
-      "chipFamily": "ESP32-C5",
-      "parts": [
-        { "path": "sixback-c5-firmware.bin",    "offset": 65536    },
-        { "path": "sixback-c5-littlefs.bin",    "offset": 3866624  }
-      ]
-    }
-  ]
-}
-EOF
-
-# --- 3c) 8-MB-S3-Variante (Seeed XIAO u.a., Issue #23) --------------------
-# esp-web-tools waehlt Builds NUR per chipFamily — ein zweiter ESP32-S3-
-# Eintrag im Haupt-Manifest waere wirkungslos (der erste gewinnt). Die
-# 8-MB-Variante bekommt deshalb ein EIGENES Manifest-Paar + eigenen
-# Install-Button auf der Landing-Page. Ein 8-MB-Board am Standard-S3-
-# Button wuerde scheitern (16-MB-Factory-Image reicht bis 0xff0000).
-# Offsets identisch zum 16-MB-S3 (App-Slots gleich gross, spiffs gleicher
-# Offset 0x610000) — nur die spiffs-GROESSE unterscheidet sich.
-write_manifest "$OUT/manifest-s3-8mb.json" <<EOF
-{
-  "name": "SixBack (S3 8MB)",
-  "version": "$VERSION",
-  "funding_url": "https://paypal.me/busware",
-  "new_install_prompt_erase": true,
-  "builds": [
-    {
-      "chipFamily": "ESP32-S3",
-      "parts": [
-        { "path": "sixback-s3-8mb-factory.bin", "offset": 0 }
-      ]
-    }
-  ]
-}
-EOF
-
-# "name" wie bei 3b exakt FW_NAME — siehe die Begruendung dort. Die
-# 8-MB-Unterscheidung traegt der Button auf der Landing-Page, nicht der
-# Manifest-Name; esp-web-tools waehlt den Build ohnehin nur per chipFamily.
-write_manifest "$OUT/manifest-update-s3-8mb.json" <<EOF
-{
-  "name": "SixBack",
-  "version": "$VERSION",
-  "funding_url": "https://paypal.me/busware",
-  "new_install_prompt_erase": true,
-  "builds": [
-    {
-      "chipFamily": "ESP32-S3",
-      "parts": [
-        { "path": "sixback-s3-8mb-firmware.bin", "offset": 65536   },
-        { "path": "sixback-s3-8mb-littlefs.bin", "offset": 6356992 }
-      ]
-    }
-  ]
-}
-EOF
+# --- 3) Manifeste schreiben — ausgelagert nach scripts/gen_manifests.sh ---
+# Der komplette Manifest-Inhalt steht dort und NUR dort: die "name"-Falle des
+# Update-Manifests (falscher Name => esp-web-tools erased das Geraet), die
+# Partition-Offsets und die Hardware-Tags (minFlashSize/psram) fuer die
+# Board-Erkennung der Landing-Page. Ausgelagert 2026-07-30, damit die
+# Manifeste ohne einen kompletten 6-Target-Build erzeugbar und pruefbar sind.
+bash "$ROOT/scripts/gen_manifests.sh" "$VERSION" "$OUT"
 
 # --- 3d) Deploy-Reihenfolge-Guard ------------------------------------------
 # Jede in index.html referenzierte Manifest-Datei muss in $OUT existieren —
 # verhindert tote Install-Buttons, wenn die Seite vor den Artefakten deployed
 # wuerde (Praezedenzfall v0.8.10: Page-only-Fix per rsync).
 manifest_missing=0
-for m in $(grep -oE 'manifest="[^"]+"' "$OUT/index.html" | cut -d'"' -f2 | sort -u); do
+for m in $(cat "$OUT"/*.html | grep -oE 'manifest="[^"]+"' | cut -d'"' -f2 | sort -u); do
   if [ ! -f "$OUT/$m" ]; then
-    echo "ABORT: index.html referenziert $m — fehlt in webflasher/" >&2
+    echo "ABORT: eine HTML-Seite referenziert $m — fehlt in webflasher/" >&2
     manifest_missing=1
   fi
 done

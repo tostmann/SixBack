@@ -172,7 +172,18 @@ bool PresetStore::saveToNVS() {
             // ausschliesslich im LOCAL_INTERNET_RADIO-Zweig.
             // NUR die Persistenz wird schlank — exportJson() bleibt absichtlich
             // vollstaendig, damit ein Export/Backup selbsttragend ist.
-            if (p.source != PresetSource::TUNEIN) {
+            //
+            // AUSNAHME Tunnel-Sentinels (sspot{N} Spotify, sstrm{N} Custom-
+            // Stream): das sind TUNEIN-Presets, deren streamUrl NICHT aus der
+            // stationId rekonstruierbar ist. Der TuneIn-Resolver
+            // (findPresetOverride) liefert sie beim HW-Tastendruck aus; bei
+            // sstrm ist die gespeicherte URL sogar die einzige Kopie. Sie
+            // wegzulassen killt den Tunnel nach dem naechsten Reboot
+            // (HW-reproduziert 2026-07-30). Kosten: ~5 Entries je Tunnel-Slot,
+            // hoechstens 6 pro Speaker und nur bei Nutzern, die Tunnel anlegen.
+            const bool isTunnelSentinel = p.stationId.startsWith("sspot")
+                                       || p.stationId.startsWith("sstrm");
+            if (p.source != PresetSource::TUNEIN || isTunnelSentinel) {
                 pj["streamUrl"] = p.streamUrl;
             }
             // imageUrl WIRD gebraucht (<containerArt>), ist bei TUNEIN aber

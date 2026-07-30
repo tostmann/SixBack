@@ -16,35 +16,23 @@
   }
   * { box-sizing: border-box; }
   body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-         max-width: 52em; margin: 0 auto; padding: 1.5em 1em;
+         max-width: 44em; margin: 0 auto; padding: 1.5em 1em;
          color: var(--ink); background: var(--bg); line-height: 1.5; }
   h1 { color: var(--accent); margin: .2em 0; font-weight: 600; font-size: 1.8em; }
-  h2 { color: var(--accent); margin-top: 1.8em; font-size: 1.2em; }
   p  { margin: .6em 0; }
   a  { color: var(--accent); }
   code { background: #fee; padding: .1em .35em; border-radius: 3px; font-size: .9em; }
-  .hero { text-align: center; padding: 1em 0 1.4em; }
+  .hero { text-align: center; padding: 1em 0 .6em; }
   .hero img { max-width: 100%; height: auto; }
   .panel { background: var(--card); border: 1px solid var(--line);
-           border-radius: 10px; padding: 1.2em 1.4em; margin: 1em 0; }
-  .panel.flash { text-align: center; }
+           border-radius: 10px; padding: 1.6em 1.4em; margin: 1em 0; text-align: center; }
   esp-web-install-button { --esp-tools-button-color: var(--accent);
                            --esp-tools-button-text-color: #fff; }
-  .targets { display: grid; grid-template-columns: repeat(auto-fit, minmax(12em, 1fr));
-             gap: .8em; margin-top: .8em; }
-  .target { background: #fbfaf6; border: 1px solid var(--line); border-radius: 6px;
-            padding: .6em .8em; font-size: .9em; }
-  .target .name { font-weight: 600; color: var(--accent); }
-  .target .meta { color: var(--mute); font-family: ui-monospace, Menlo, monospace; font-size: .8em; }
-  .screenshot { text-align: center; margin: 1em 0; }
+  .steps { color: var(--mute); font-size: .95em; margin-top: 1em; }
+  .screenshot { text-align: center; margin: 1.4em 0; }
   .screenshot img { max-width: 100%; height: auto; border: 1px solid var(--line);
                     border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
   .screenshot figcaption { color: var(--mute); font-size: .85em; margin-top: .4em; }
-  .warn { background: #fce8d2; border-left: 4px solid var(--warn);
-          padding: .6em 1em; border-radius: 4px; margin: 1em 0; }
-  .ok   { background: #e1f1e5; border-left: 4px solid var(--ok);
-          padding: .6em 1em; border-radius: 4px; margin: 1em 0; }
-  ol li, ul li { margin: .3em 0; }
   footer { margin-top: 2em; padding-top: 1em; border-top: 1px solid var(--line);
            color: var(--mute); font-size: .85em; text-align: center; }
 </style>
@@ -54,233 +42,50 @@
 <div class="hero">
   <img src="images/sixback-logo.png" alt="SixBack" width="320">
   <h1>SixBack — Web Flasher</h1>
-  <p style="color:var(--mute)">Local SoundTouch cloud replacement on an ESP32 stick.<br>
-     Bose shut their cloud down — this brings the preset buttons back.</p>
-  <p>Source code &amp; bug reports:
-     <a href="https://github.com/tostmann/SixBack" target="_blank" rel="noopener">github.com/tostmann/SixBack</a></p>
+  <p style="color:var(--mute)">Bose shut the SoundTouch cloud down.<br>
+     SixBack on a 5-€ ESP32 brings the preset buttons back.</p>
 </div>
 
-<div class="panel flash">
-  <h2 style="margin-top:0">Install SixBack on your ESP32</h2>
-  <p>Plug your ESP32 board into USB, click below, and pick the serial port that appears.<br>
-     The browser detects the chip and flashes the matching image.</p>
-  <p style="display:flex; gap:1.5em; justify-content:center; flex-wrap:wrap; align-items:flex-start; margin-top:1em">
-    <span style="text-align:center">
-      <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
-      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install — writes the complete image</small>
-    </span>
-    <span style="text-align:center">
-      <esp-web-install-button manifest="manifest-update.json"></esp-web-install-button>
-      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update existing — keeps WiFi + presets + Spotify auth</small>
-    </span>
+<div class="panel">
+  <p style="margin:0 0 1em">Plug your ESP32 board into USB, then:</p>
+  <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+  <p class="steps">
+    Pick the serial port, and the flasher installs SixBack
+    <code id="ver">…</code> — the right image for your chip is chosen
+    automatically. Afterwards it asks for your WiFi, then SixBack finds and
+    migrates your speakers on its own. Presets survive.
   </p>
-  <p style="color:var(--mute); font-size:.85em">
-    Version <code id="ver">…</code> — pick <b>Fresh install</b> for a new stick,
-    <b>Update existing</b> for a stick that already runs SixBack.
-  </p>
-  <div class="warn">
-    <strong>If the flasher offers to erase the device, leave the “Erase device” box unticked.</strong>
-    The tool asks this whenever it cannot read the firmware name off the stick — which happens
-    once the provisioning window has closed, i.e. on any board that has been running for a while.
-    <b>Update existing</b> only needs to write the firmware and the filesystem; erasing first would
-    additionally remove the bootloader, which this image does not contain, and the stick would no
-    longer start. The box is unticked by default, so simply continuing is the correct choice.
-    <br><br>
-    Already running SixBack? You do not need the flasher at all — open the stick's Web UI and use
-    <b>Firmware&nbsp;→&nbsp;Update</b>, which downloads the same files over the air and never touches
-    your settings.
-  </div>
-  <div class="warn">
-    <strong>ESP32-S3-DevKitC-1 has two USB sockets — since <b>v0.8.35</b> you can use either one.</strong>
-    The socket labelled <code>UART</code> appears as a <code>CH340</code>/<code>CH343</code> serial
-    port and also carries the console log. The board's native <code>USB</code> socket now works for
-    the complete run as well — factory flash <em>and</em> the <b>“Connect device to Wi-Fi”</b> step
-    have been verified end-to-end over it, because this image answers the provisioning handshake on
-    both ports. <b>Releases before v0.8.35 answered on the <code>UART</code> port only.</b>
-    <br><br>
-    Two harmless things you may notice in the browser's developer console: an
-    <em>“Error fetching current state: TIMEOUT”</em> appears at roughly 88&nbsp;% of the flash — that
-    is the tool's provisioning check timing out while the chip is still in download mode, the flash
-    continues and completes normally. And on the native <code>USB</code> socket the console log
-    shares the port with the handshake, so in rare cases the browser may report <em>“Improv Wi-Fi
-    Serial not detected”</em>; if that happens, or if a run stops at
-    <code>Hard resetting via RTS pin</code>, just retry, use the <code>UART</code> socket, or set up
-    Wi-Fi through the <code>SixBack-…</code> hotspot the stick opens. Single-socket boards
-    (XIAO&nbsp;S3, ESP32-C3&nbsp;/&nbsp;C6&nbsp;/&nbsp;C5) have only one port and are flashed and
-    provisioned over it as usual.
-  </div>
-  <hr style="border:none; border-top:1px solid var(--mute); opacity:.3; margin:1.2em 0">
-  <h3 style="margin:.2em 0 .4em">ESP32-S3 with 8&nbsp;MB flash (Seeed XIAO ESP32S3 &amp; similar)</h3>
-  <p style="font-size:.9em">The buttons above flash the <b>16&nbsp;MB</b> S3 layout. Boards with only
-     <b>8&nbsp;MB flash + PSRAM</b> (e.g. Seeed&nbsp;XIAO&nbsp;ESP32S3) need this dedicated image instead —
-     the standard one does not fit and the flash would fail partway through.</p>
-  <p style="display:flex; gap:1.5em; justify-content:center; flex-wrap:wrap; align-items:flex-start; margin-top:.6em">
-    <span style="text-align:center">
-      <esp-web-install-button manifest="manifest-s3-8mb.json"></esp-web-install-button>
-      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install (S3 8&nbsp;MB) — writes the complete image</small>
-    </span>
-    <span style="text-align:center">
-      <esp-web-install-button manifest="manifest-update-s3-8mb.json"></esp-web-install-button>
-      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update existing (S3 8&nbsp;MB) — keeps settings</small>
-    </span>
-  </p>
-  <p style="color:var(--mute); font-size:.85em">
-    Not sure which one you have? The <code>Nxx</code> in the module name tells the flash size:
-    <code>N8…</code>&nbsp;=&nbsp;8&nbsp;MB, <code>N16…</code>&nbsp;=&nbsp;16&nbsp;MB.
-    XIAO&nbsp;ESP32S3 / Sense&nbsp;=&nbsp;8&nbsp;MB; XIAO&nbsp;ESP32S3&nbsp;<em>Plus</em>&nbsp;=&nbsp;16&nbsp;MB
-    (use the standard buttons above). PSRAM is required either way.<br>
-    <b>Use the update button only for the variant the device was originally flashed
-    with</b> — a device running the 16&nbsp;MB layout must use the standard update button,
-    and vice versa. Already-flashed devices show their layout in the Web&nbsp;UI status
-    line ("ESP32-S3 8MB" / "16MB").<br>
-    Manual flashing (esptool): <a href="sixback-s3-8mb-factory.bin">factory</a> @0x0 ·
-    <a href="sixback-s3-8mb-firmware.bin">firmware</a> @0x10000 ·
-    <a href="sixback-s3-8mb-littlefs.bin">littlefs</a> @0x610000
+  <p class="steps" style="margin-top:1.2em">
+    Already running SixBack? Update from the stick's own page —
+    <b>⚙&nbsp;SYSTEM&nbsp;→&nbsp;Update</b> — no USB needed.<br>
+    Special boards (8&nbsp;MB&nbsp;S3, 16&nbsp;MB&nbsp;C5), board identification and
+    manual flashing: <a href="boards.html"><b>boards page</b></a>.
   </p>
 </div>
 
-<div class="warn">
-  <strong>⚠ Auto-migration runs by default.</strong>
-  Right after WiFi provisioning, SixBack will <em>automatically</em>
-  discover every SoundTouch speaker on your LAN (model whitelist
-  <code>SoundTouch 10/20/30</code>, firmware <code>27.0.6.x</code> /
-  <code>27.0.3.x</code>) and rewrite its cloud URLs to point at the stick
-  — each speaker reboots once in the process (~60 s).  Existing presets
-  are preserved automatically.  After the initial boot pass the
-  auto-mode stays armed as a periodic cron (default every 30 minutes)
-  and picks up newcomers automatically.<br>
-  <br>
-  If you want to drive migrations by hand, open
-  <code>http://sixback.local/</code> right after provisioning and flip
-  the <strong>Auto-Migrate at Boot</strong> switch at the top
-  <em>before</em> the device finishes discovering your speakers.
-</div>
-
-<div class="ok">
-  <strong>Recommended hardware: ESP32-S3-DevKitC-1-N16R8</strong> —
-  16 MB flash, 8 MB PSRAM, mature WiFi 5 stack.  In extended end-to-end
-  testing this was the most robust target.  ESP32 / C3 / C6 / C5 work too
-  (factory image auto-selected), but the C6's WiFi 6 stack occasionally
-  needed a second boot to discover all speakers, and the 4-MB targets
-  are tight on flash for future features.<br>
-  <br>
-  <strong>Only the ESP32-C5 speaks dual-band 2.4 / 5&nbsp;GHz WiFi&nbsp;6</strong> —
-  pick it if your network runs on 5&nbsp;GHz. Every other target is 2.4&nbsp;GHz
-  only (the C6 is WiFi&nbsp;6 but 2.4&nbsp;GHz only). The C5 image is auto-selected
-  by chip family just like the rest.
-</div>
-
-<div class="warn">
-  <strong>Browser requirement:</strong> Web&nbsp;Serial is only implemented in
-  Chromium-based desktop browsers — <strong>Chrome, Edge, Opera, Brave</strong>
-  on macOS / Windows / Linux. Safari, Firefox and all mobile browsers are
-  <em>not</em> supported.
-</div>
-
-<h2>What you get</h2>
-<p>After flashing, point your browser at <code>http://sixback.local/</code>: discover the speakers
-on your LAN, migrate them off the dead Bose cloud, and manage all six preset buttons by
-drag &amp; drop — search TuneIn / add custom streams in the sidebar, drag tiles onto preset
-slots, push to the speaker.</p>
 <figure class="screenshot">
   <img src="images/WebUIRadioSelector.png"
        alt="SixBack Web UI — TuneIn search sidebar + per-speaker preset slots"
        loading="lazy">
-  <figcaption>SixBack Web UI — TuneIn search on the left, per-speaker preset slots on the right, drag &amp; drop to assign.</figcaption>
+  <figcaption>Search TuneIn on the left, drag stations onto the preset slots, push to the speaker.</figcaption>
 </figure>
-
-<h2>Supported targets</h2>
-<div class="targets" id="targets">…</div>
-
-<h2>How it works</h2>
-<ol>
-  <li>Click <strong>CONNECT</strong> above and pick the serial port of your ESP32.</li>
-  <li>esp-web-tools reads the chip family from the bootloader and selects the
-      matching factory image from <a href="manifest.json"><code>manifest.json</code></a>.</li>
-  <li>The factory image — bootloader + partition table + firmware + Web UI —
-      is written to <code>0x0</code> in one shot. Old contents are erased.</li>
-  <li>After reboot, SixBack starts in <strong>Improv-Wi-Fi</strong> mode and
-      waits for credentials. esp-web-tools offers the Improv flow right after
-      flashing, so you can hand over Wi-Fi SSID and password from the same page.</li>
-  <li>The device then advertises itself as <code>sixback.local</code> on mDNS;
-      open <code>http://sixback.local/</code> to manage your Bose speakers.</li>
-</ol>
-
-<div class="ok">
-  <strong>OTA updates later:</strong> once SixBack runs on the device, future
-  updates can be uploaded via the Web&nbsp;UI's <em>System</em> panel without
-  USB — that's what the <code>*-firmware.bin</code> and <code>*-littlefs.bin</code>
-  files next to the factory images are for.
-</div>
-
-<h2>Manual install (if Web&nbsp;Serial doesn't work)</h2>
-<p>Each target ships three artefacts you can download and flash manually with
-   <a href="https://github.com/espressif/esptool"><code>esptool.py</code></a>:</p>
-<ul>
-  <li><code>sixback-&lt;tgt&gt;-factory.bin</code> — full image, flash to <code>0x0</code></li>
-  <li><code>sixback-&lt;tgt&gt;-firmware.bin</code> — app only, for OTA</li>
-  <li><code>sixback-&lt;tgt&gt;-littlefs.bin</code> — Web UI assets, for FS-OTA</li>
-</ul>
-<p>Example:</p>
-<pre><code>esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0x0 sixback-s3-factory.bin</code></pre>
-
-<div class="warn" style="background:#fff8e6;border-left-color:#7a3e00">
-  <strong>License — Noncommercial Use Only.</strong>
-  By clicking INSTALL above you agree that you will use this firmware for
-  personal, hobby, research, or other noncommercial purposes only.
-  Selling devices with this firmware pre-flashed, offering it as a paid
-  service, or any other commercial use requires a separate written license
-  from the copyright holder. Full terms:
-  <a href="https://polyformproject.org/licenses/noncommercial/1.0.0" target="_blank" rel="noopener">PolyForm Noncommercial 1.0.0</a>
-  · commercial inquiries: <code>tostmann@gmail.com</code>.
-</div>
 
 <footer>
   SixBack &copy; 2026 Dirk Tostmann &middot;
-  source code &amp; bug reports:
-  <a href="https://github.com/tostmann/SixBack" target="_blank" rel="noopener">github.com/tostmann/SixBack</a>
-  &middot; <a href="https://polyformproject.org/licenses/noncommercial/1.0.0" target="_blank" rel="noopener">PolyForm Noncommercial 1.0.0</a>
-  &middot; Hosted at <a href="https://sixback.io/">sixback.io</a>
+  <a href="https://github.com/tostmann/SixBack" target="_blank" rel="noopener">source &amp; bug reports</a>
+  &middot; noncommercial use only
+  (<a href="https://polyformproject.org/licenses/noncommercial/1.0.0" target="_blank" rel="noopener">PolyForm-NC&nbsp;1.0.0</a>,
+  commercial inquiries: <code>tostmann@gmail.com</code>)
+  &middot; requires Chrome/Edge on desktop
   &middot; not affiliated with Bose Corporation.
 </footer>
 
 <script type="module"
         src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
 <script>
-  // Pull the version + target list out of the manifest so the page never drifts.
   fetch('manifest.json').then(r => r.json()).then(m => {
     document.getElementById('ver').textContent = m.version || '?';
-    // S3 first + visually marked as recommended. esp-web-tools picks the right
-    // image by chip-family automatically; the order here is purely cosmetic.
-    const order = ['ESP32-S3', 'ESP32', 'ESP32-C3', 'ESP32-C6', 'ESP32-C5'];
-    const sorted = (m.builds || []).slice().sort(
-      (a, b) => order.indexOf(a.chipFamily) - order.indexOf(b.chipFamily));
-    document.getElementById('targets').innerHTML = sorted.map(b => {
-      const part = (b.parts || [])[0] || {};
-      const rec  = b.chipFamily === 'ESP32-S3'
-        ? ' <span style="color:var(--ok);font-weight:600">★ recommended</span>'
-        : '';
-      // Derive the per-target file base from the factory path
-      // ("sixback-s3-factory.bin" -> "sixback-s3") and link all three
-      // artefacts directly: factory (full USB flash) plus firmware.bin +
-      // littlefs.bin for the in-device "Manual upload" (keeps settings, no USB).
-      const base = (part.path || '').replace(/-factory\.bin$/, '');
-      const dl = base
-        ? `<div class="meta" style="display:flex;gap:.7em;flex-wrap:wrap;margin-top:.35em">
-             <a href="${base}-factory.bin" download>factory.bin</a>
-             <a href="${base}-firmware.bin" download>firmware.bin</a>
-             <a href="${base}-littlefs.bin" download>littlefs.bin</a>
-           </div>`
-        : `<div class="meta">${part.path || ''}</div>`;
-      return `<div class="target">
-                <div class="name">${b.chipFamily}${rec}</div>
-                ${dl}
-              </div>`;
-    }).join('');
-  }).catch(() => {
-    document.getElementById('targets').textContent =
-      'manifest.json not reachable — make sure the directory is served over HTTPS.';
-  });
+  }).catch(() => {});
 </script>
 </body>
 </html>

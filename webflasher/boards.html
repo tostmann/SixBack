@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SixBack — Boards, Variants &amp; Manual Install</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="SixBack board variants: S3 8 MB, C5 16 MB + PSRAM, board identification, update over USB, manual esptool flashing.">
+<style>
+  :root {
+    --bg:#f7f6f3; --card:#fff; --ink:#222; --mute:#777;
+    --ok:#1f7a3a; --warn:#b86c00; --bad:#a32525; --accent:#7a3e00;
+    --line:#e1ddd2;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+         max-width: 52em; margin: 0 auto; padding: 1.5em 1em;
+         color: var(--ink); background: var(--bg); line-height: 1.5; }
+  h1 { color: var(--accent); margin: .2em 0; font-weight: 600; font-size: 1.5em; }
+  h2 { color: var(--accent); margin-top: 1.8em; font-size: 1.2em; }
+  h3 { margin: .2em 0 .4em; }
+  p  { margin: .6em 0; }
+  a  { color: var(--accent); }
+  code { background: #fee; padding: .1em .35em; border-radius: 3px; font-size: .9em; }
+  .panel { background: var(--card); border: 1px solid var(--line);
+           border-radius: 10px; padding: 1.2em 1.4em; margin: 1em 0; }
+  .panel.flash { text-align: center; }
+  esp-web-install-button { --esp-tools-button-color: var(--accent);
+                           --esp-tools-button-text-color: #fff; }
+  .detect { background:#fbfaf6; border:1px solid var(--line); border-radius:8px;
+            padding:.7em .9em; margin:.8em 0 1.2em; text-align:left; font-size:.9em; }
+  .detect button { font: inherit; font-weight:600; cursor:pointer; color:#fff;
+                   background:var(--accent); border:0; border-radius:6px;
+                   padding:.45em 1em; }
+  .detect button[disabled] { background:var(--mute); cursor:not-allowed; }
+  .detect .out { margin-top:.5em; color:var(--mute); }
+  .detect .out b { color:var(--ink); }
+  .choice { text-align:center; border:2px solid transparent; border-radius:8px;
+            padding:.5em .6em; transition:opacity .2s; }
+  .choice.fit    { border-color:var(--ok); background:#f2f9f4; }
+  .choice.unfit  { opacity:.45; }
+  .choice .verdict { display:block; margin-top:.35em; font-size:.8em; font-weight:600; }
+  .choice.fit    .verdict { color:var(--ok); }
+  .choice.unfit  .verdict { color:var(--bad); font-weight:400; }
+  .btnrow { display:flex; gap:1.5em; justify-content:center; flex-wrap:wrap;
+            align-items:flex-start; margin-top:.6em; }
+  .targets { display: grid; grid-template-columns: repeat(auto-fit, minmax(12em, 1fr));
+             gap: .8em; margin-top: .8em; }
+  .target { background: #fbfaf6; border: 1px solid var(--line); border-radius: 6px;
+            padding: .6em .8em; font-size: .9em; }
+  .target .name { font-weight: 600; color: var(--accent); }
+  .target .meta { color: var(--mute); font-family: ui-monospace, Menlo, monospace; font-size: .8em; }
+  .warn { background: #fce8d2; border-left: 4px solid var(--warn);
+          padding: .6em 1em; border-radius: 4px; margin: 1em 0; font-size:.9em; }
+  .fineprint { color: var(--mute); font-size: .85em; }
+  ol li, ul li { margin: .3em 0; }
+  footer { margin-top: 2em; padding-top: 1em; border-top: 1px solid var(--line);
+           color: var(--mute); font-size: .85em; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>SixBack — Boards, Variants &amp; Manual Install</h1>
+<p class="fineprint"><a href="index.html">← back to the one-click installer</a></p>
+
+<div class="panel">
+  <h2 style="margin-top:0">🔍 Identify my board</h2>
+  <div class="detect">
+    <button id="detect-btn" type="button">🔍&nbsp;Identify my board</button>
+    <div class="out" id="detect-out">Optional, read-only: reads chip type, flash size and
+      (on the S3 and C5) PSRAM straight off the board, then marks the image on this page
+      that fits. Nothing is written and the board keeps running afterwards. If none of the
+      images below fit, your board uses the <a href="index.html">standard installer</a>.</div>
+  </div>
+</div>
+
+<div class="panel flash">
+  <h2 style="margin-top:0">Standard boards — install or update over USB</h2>
+  <p class="fineprint">The same images as the <a href="index.html">one-click installer</a>,
+     plus the USB update path. The right chip image is selected automatically
+     (ESP32 / S3 / C3 / C6 / C5).</p>
+  <p class="btnrow">
+    <span class="choice">
+      <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install — writes the complete image</small>
+    </span>
+    <span class="choice">
+      <esp-web-install-button manifest="manifest-update.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update existing — keeps WiFi + presets + Spotify auth</small>
+    </span>
+  </p>
+  <div class="warn" style="text-align:left">
+    <strong>If the flasher offers to erase the device, leave the box unticked.</strong>
+    It asks whenever it cannot read the firmware name off the stick (normal once a board has
+    been running for a while). <b>Update existing</b> writes no bootloader — erasing first
+    would leave the stick unable to start. Devices already running SixBack can skip the
+    flasher entirely: the stick's own <b>⚙&nbsp;SYSTEM&nbsp;→&nbsp;Update</b> updates over
+    WiFi and never touches settings.
+  </div>
+</div>
+
+<div class="panel flash">
+  <h3>ESP32-S3 with 8&nbsp;MB flash (Seeed XIAO ESP32S3 &amp; similar)</h3>
+  <p class="fineprint">The standard buttons flash the <b>16&nbsp;MB</b> S3 layout. Boards with only
+     <b>8&nbsp;MB flash + PSRAM</b> (e.g. Seeed&nbsp;XIAO&nbsp;ESP32S3) need this dedicated image —
+     the standard one does not fit and the flash would fail partway through.</p>
+  <p class="btnrow">
+    <span class="choice">
+      <esp-web-install-button manifest="manifest-s3-8mb.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install (S3 8&nbsp;MB) — writes the complete image</small>
+    </span>
+    <span class="choice">
+      <esp-web-install-button manifest="manifest-update-s3-8mb.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update existing (S3 8&nbsp;MB) — keeps settings</small>
+    </span>
+  </p>
+  <p class="fineprint">
+    The <code>Nxx</code> in the module name tells the flash size:
+    <code>N8…</code>&nbsp;=&nbsp;8&nbsp;MB, <code>N16…</code>&nbsp;=&nbsp;16&nbsp;MB.
+    XIAO&nbsp;ESP32S3 / Sense&nbsp;=&nbsp;8&nbsp;MB; XIAO&nbsp;ESP32S3&nbsp;<em>Plus</em>&nbsp;=&nbsp;16&nbsp;MB
+    (standard buttons). PSRAM is required either way.
+    <b>Use the update button only for the variant the device was originally flashed
+    with</b> — already-flashed devices show their layout in the Web&nbsp;UI status line
+    ("ESP32-S3 8MB" / "16MB").<br>
+    Manual flashing (esptool): <a href="sixback-s3-8mb-factory.bin">factory</a> @0x0 ·
+    <a href="sixback-s3-8mb-firmware.bin">firmware</a> @0x10000 ·
+    <a href="sixback-s3-8mb-littlefs.bin">littlefs</a> @0x610000
+  </p>
+</div>
+
+<div class="panel flash">
+  <h3>ESP32-C5 with 16&nbsp;MB flash + PSRAM (N16R8 modules)</h3>
+  <p class="fineprint">The standard buttons flash the C5 image laid out for <b>4&nbsp;MB</b> boards.
+     It runs on a 16&nbsp;MB board too, but leaves 12&nbsp;MB of flash and the entire in-package
+     PSRAM unused. Boards with an <b>ESP32-C5-WROOM-1-N16R8</b> module (16&nbsp;MB flash +
+     8&nbsp;MB PSRAM) should use this dedicated image — it uses the full flash and enables the
+     PSRAM, which lifts the tight-memory limits of the small C5 (Spotify support, online OTA,
+     far more headroom for many speakers).</p>
+  <p class="btnrow">
+    <span class="choice">
+      <esp-web-install-button manifest="manifest-c5-16mb.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install (C5 16&nbsp;MB) — writes the complete image</small>
+    </span>
+    <span class="choice">
+      <esp-web-install-button manifest="manifest-update-c5-16mb.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update existing (C5 16&nbsp;MB) — keeps settings</small>
+    </span>
+  </p>
+  <p class="fineprint">
+    Not sure which C5 you have? Use <b>🔍&nbsp;Identify my board</b> above — it reads the flash
+    size and the PSRAM eFuse off the chip and marks the right pair.
+    <b>Use the update button only for the variant the device was originally flashed with</b> —
+    a device running the 4&nbsp;MB layout keeps using the standard update button until it is
+    re-installed once with this image (settings survive that switch; the storage layout of the
+    settings area is identical).<br>
+    Manual flashing (esptool&nbsp;≥&nbsp;5): <a href="sixback-c5-16mb-factory.bin">factory</a> @0x0 ·
+    <a href="sixback-c5-16mb-firmware.bin">firmware</a> @0x10000 ·
+    <a href="sixback-c5-16mb-littlefs.bin">littlefs</a> @0x610000
+  </p>
+</div>
+
+<h2>Notes per board</h2>
+<div class="warn">
+  <strong>ESP32-S3-DevKitC-1 has two USB sockets — since <b>v0.8.35</b> you can use either one.</strong>
+  The socket labelled <code>UART</code> appears as a <code>CH340</code>/<code>CH343</code> serial
+  port and also carries the console log. The board's native <code>USB</code> socket works for
+  the complete run as well — factory flash <em>and</em> the <b>“Connect device to Wi-Fi”</b> step —
+  because the image answers the provisioning handshake on both ports.
+  Two harmless quirks: an <em>“Error fetching current state: TIMEOUT”</em> in the browser console
+  at ~88&nbsp;% of the flash (the flash completes normally), and on the native socket the console
+  log shares the port with the handshake, so rarely the browser reports <em>“Improv Wi-Fi Serial
+  not detected”</em> — retry, use the <code>UART</code> socket, or set up WiFi through the
+  <code>SixBack-…</code> hotspot the stick opens.
+</div>
+<div class="warn">
+  <strong>Auto-migration runs by default.</strong> Right after WiFi provisioning, SixBack
+  discovers every SoundTouch speaker on your LAN (SoundTouch 10/20/30) and rewrites its cloud
+  URLs to point at the stick — each speaker reboots once (~60&nbsp;s), existing presets are
+  preserved, and a periodic check picks up newcomers. To drive migrations by hand instead, open
+  <code>http://sixback.local/</code> right after provisioning and switch
+  <strong>Auto-Migrate at Boot</strong> off before discovery finishes.
+</div>
+<div class="warn">
+  <strong>Recommended hardware: ESP32-S3-DevKitC-1-N16R8</strong> — 16&nbsp;MB flash, 8&nbsp;MB
+  PSRAM, the most robust target in extended testing. <strong>Only the ESP32-C5 speaks
+  2.4&nbsp;+&nbsp;5&nbsp;GHz WiFi</strong> — pick it if your network runs on 5&nbsp;GHz, ideally
+  the 16&nbsp;MB N16R8 variant above. Every other target is 2.4&nbsp;GHz only.
+  Web&nbsp;Serial needs a Chromium desktop browser (Chrome, Edge, Opera, Brave).
+</div>
+
+<h2>How it works</h2>
+<ol>
+  <li>The install button reads the chip family from the boot ROM and selects the matching
+      factory image from the manifest.</li>
+  <li>The factory image — bootloader + partition table + firmware + Web&nbsp;UI — is written
+      in one shot.</li>
+  <li>After reboot, SixBack waits for WiFi credentials (Improv); the flasher offers the
+      <b>Connect device to Wi-Fi</b> step right away.</li>
+  <li>The device comes up as <code>sixback.local</code> — open
+      <code>http://sixback.local/</code> to manage your speakers.</li>
+</ol>
+
+<h2>Manual install (esptool)</h2>
+<p class="fineprint">Each target ships three artefacts:
+   <code>…-factory.bin</code> (full image → <code>0x0</code>),
+   <code>…-firmware.bin</code> (app only, for OTA) and
+   <code>…-littlefs.bin</code> (Web&nbsp;UI, for FS-OTA). Example:</p>
+<pre><code>esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0x0 sixback-s3-factory.bin</code></pre>
+<div class="targets" id="targets">…</div>
+
+<footer>
+  SixBack &copy; 2026 Dirk Tostmann &middot;
+  <a href="https://github.com/tostmann/SixBack" target="_blank" rel="noopener">source &amp; bug reports</a>
+  &middot; noncommercial use only
+  (<a href="https://polyformproject.org/licenses/noncommercial/1.0.0" target="_blank" rel="noopener">PolyForm-NC&nbsp;1.0.0</a>,
+  commercial inquiries: <code>tostmann@gmail.com</code>)
+  &middot; not affiliated with Bose Corporation.
+</footer>
+
+<script type="module"
+        src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<script>
+  // Per-target artefact links, derived from the manifests so the grid can
+  // never drift from what is actually served.
+  Promise.all(['manifest.json', 'manifest-s3-8mb.json', 'manifest-c5-16mb.json']
+    .map(u => fetch(u).then(r => r.json()).catch(() => null)))
+  .then(ms => {
+    const builds = ms.filter(Boolean).flatMap(m => m.builds || []);
+    document.getElementById('targets').innerHTML = builds.map(b => {
+      const part = (b.parts || [])[0] || {};
+      const tag  = (b.sixback && b.sixback.target) || b.chipFamily;
+      const base = (part.path || '').replace(/-factory\.bin$/, '');
+      const meta = b.sixback
+        ? `<div class="meta">${b.sixback.minFlashSize} flash · PSRAM ${b.sixback.psram === 'required' ? 'required' : 'not used'}</div>`
+        : '';
+      return `<div class="target">
+                <div class="name">${b.chipFamily} <span style="color:var(--mute)">(${tag})</span></div>
+                ${meta}
+                <div class="meta" style="display:flex;gap:.7em;flex-wrap:wrap;margin-top:.35em">
+                  <a href="${base}-factory.bin" download>factory.bin</a>
+                  <a href="${base}-firmware.bin" download>firmware.bin</a>
+                  <a href="${base}-littlefs.bin" download>littlefs.bin</a>
+                </div>
+              </div>`;
+    }).join('');
+  });
+</script>
+<script src="board-detect.js"></script>
+</body>
+</html>

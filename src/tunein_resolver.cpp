@@ -232,18 +232,22 @@ bool findPresetOverride(const String& id, String& url, String& name, String& ima
     // exportJson+Parse, sonst frisst das Heap+CPU bei jedem Tastendruck.
     Preset p;
     if (!PresetStore::instance().findByStationId(id, p)) return false;
-    if (p.streamUrl.length() == 0) return false;
-    url   = p.streamUrl;
     name  = p.name;
     image = p.imageUrl;
     // Spotify-Tunnel-Sentinel (sspot1..sspot6) braucht eine TLS-freie streamUrl,
     // weil Bose-FW (2021) das Cloudflare-Cert von sixback.io nicht validiert
     // (INVALID_SOURCE-State, long-press persistiert dann nichts). Lokal vom
     // ESP serven, HTTP only — funktioniert unabhaengig von der Stored-URL.
+    // Steht VOR dem Leer-Guard, weil die gespeicherte URL hier inhaltlich egal
+    // ist: ein unter v0.8.36 ohne streamUrl persistierter Slot scheiterte sonst
+    // am Guard und fiel auf "Unknown (sspotN)" mit leerem streams[] zurueck.
     if (id.startsWith("sspot")) {
         url = "http://" + WiFi.localIP().toString() + ":" + String(BOSE_HTTP_PORT)
             + "/silence.mp3";
+        return true;
     }
+    if (p.streamUrl.length() == 0) return false;
+    url = p.streamUrl;
     return true;
 }
 

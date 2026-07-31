@@ -210,6 +210,7 @@ bool PresetStore::saveToNVS() {
     // vollstaendig, der naechste Save (mit mehr Heap) heilt.
     if (doc.overflowed()) {
         ++saveFails_;
+        ++saveHeapAborts_;          // transient: NVS intakt, naechster Save heilt
         Serial.println("[preset] saveToNVS ABORT: JsonDocument overflowed "
                        "(heap zu knapp) — NVS-Stand bleibt unangetastet");
         return false;
@@ -223,6 +224,9 @@ bool PresetStore::saveToNVS() {
         // Zentrale Zaehlung fuer ALLE Caller — clear()/syncToGroup()
         // ignorierten das Ergebnis bis 2026-07-17 komplett (silent loss).
         ++saveFails_;
+        ++saveNvsFails_;            // echter Schreibfehler = Kapazitaetskante
+        Serial.printf("[preset] saveToNVS FAILED (nvs write, #%u)\n",
+                      (unsigned)saveNvsFails_);
     }
     return ok;
 }

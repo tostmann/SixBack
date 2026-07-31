@@ -22,8 +22,19 @@
 
 namespace sixback {
 
+// Lab-Probe-Builds (SIXBACK_CONTIG_PROBE) starten mit auto-mode AUS: ein
+// Probe-Board mit leerem NVS haengt im selben LAN wie produktiv genutzte
+// Speaker und wuerde die sonst zero-touch an sich reissen.
+#ifndef SIXBACK_AUTOMODE_DEFAULT
+#  if SIXBACK_CONTIG_PROBE
+#    define SIXBACK_AUTOMODE_DEFAULT false
+#  else
+#    define SIXBACK_AUTOMODE_DEFAULT true
+#  endif
+#endif
+
 struct AutoModeConfig {
-    bool      enabled       = true;   // Image-Default an: flash → provision → migrate zero-touch
+    bool      enabled       = SIXBACK_AUTOMODE_DEFAULT;  // Image-Default an: flash → provision → migrate zero-touch
     bool      dryRun        = false;
     uint32_t  bootDelayMs   = 10000;
     uint32_t  maxPerBoot    = 4;      // typischer Haushalt 1-4 SoundTouch — alle in einem Boot durch

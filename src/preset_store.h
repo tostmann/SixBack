@@ -123,6 +123,19 @@ public:
     // zentral gezaehlt fuer ALLE Caller (set/setSlots/clear/syncToGroup/
     // importJson) — runtime-only, via /api/status preset_store.save_fails.
     uint32_t saveFails() const         { return saveFails_; }
+    // Aufschluesselung nach URSACHE (v0.8.38, FHEM 144729 msg1367274). Der
+    // Summenzaehler oben mischt zwei GEGENSAETZLICHE Faelle, was einen
+    // Feld-Dump nicht diagnostizierbar macht:
+    //   saveHeapAborts: JsonDocument lief bei Heap-Knappheit ueber, der Save
+    //     wurde BEWUSST abgebrochen. NVS bleibt intakt, RAM vollstaendig, der
+    //     naechste Save heilt -> transient, KEIN Datenverlust.
+    //   saveNvsFails:   nvsSaveJsonWithCleanup() hat abgelehnt = echter
+    //     Schreibfehler (Platz/Partition) -> DAS ist die Kapazitaetskante.
+    // Gleiche Logik wie die Reject-Aufschluesselung im OutboundGuard
+    // (rej_floor_total/rej_floor_block/rej_inflight, FHEM 144729 #155):
+    // ohne sie ist "save_fails: 1" im Feld nicht bewertbar.
+    uint32_t saveHeapAborts() const    { return saveHeapAborts_; }
+    uint32_t saveNvsFails() const      { return saveNvsFails_; }
     // Anzahl Speaker-Eintraege im Store (Boot-Forensik: wie viele Slices
     // der Load tatsaechlich geliefert hat).
     size_t   speakerCount();
@@ -144,7 +157,9 @@ private:
 
     mutable SemaphoreHandle_t mx_ = nullptr;
     bool     loadFailed_ = false;   // Blob vorhanden aber unlesbar (Boot)
-    uint32_t saveFails_  = 0;       // saveToNVS-Fehlschlaege seit Boot
+    uint32_t saveFails_  = 0;       // saveToNVS-Fehlschlaege seit Boot (Summe)
+    uint32_t saveHeapAborts_ = 0;   // davon: JsonDocument-Overflow (transient)
+    uint32_t saveNvsFails_   = 0;   // davon: echter NVS-Schreibfehler
 };
 
 const char* presetSourceToStr(PresetSource s);

@@ -77,6 +77,90 @@ std::atomic<uint32_t> g_rejFloorTotal{0};
 std::atomic<uint32_t> g_rejFloorBlock{0};
 std::atomic<uint32_t> g_rejInflight{0};
 
+// -----------------------------------------------------------------------------
+// SIXBACK_CONTIG_PROBE — Lab-Instrumentierung, NICHT im Release-Build (eigene
+// pio-Envs *-probe). Hintergrund: outboundBlockFloor() ist mit 16000 fest
+// verdrahtet und der EINZIGE Guard-Zweig, der nicht mit PSRAM skaliert; der
+// Check laeuft auf MALLOC_CAP_INTERNAL, PSRAM hilft dort per Konstruktion
+// nicht. betateilchens C5-N16R8-Dump (FHEM 144729 msg1367262) zeigt 27 von 27
+// Rejects aus genau diesem Zweig bei largest_block 15348. Diese Sonde misst,
+// wieviel zusammenhaengenden INTERNAL-Heap die zwei Live-Handler real
+// brauchen, damit die Schwelle gegen Zahlen statt gegen Bauchgefuehl steht.
+#if SIXBACK_CONTIG_PROBE
+#include <vector>
+std::atomic<uint32_t> g_probeRuns{0};
+std::atomic<uint32_t> g_probeFails{0};
+std::atomic<uint32_t> g_probeLbWorst{0xFFFFFFFFu};  // kleinster je gesehener largest_block
+std::atomic<uint32_t> g_probeLbDropMax{0};          // groesster (entry-min) ueber alle Laeufe
+std::atomic<uint32_t> g_probeFreeDropMax{0};
+std::atomic<uint32_t> g_probeBodyMax{0};
+std::atomic<uint32_t> g_probeFloor{16000};          // laufzeit-verstellbar (Floor-Sweep)
+
+// Ein Sampler-Objekt pro Handler-Lauf, auf dem Stack. Die Live-Handler laufen
+// alle im EINEN async_tcp-Task, es gibt also keine Verschachtelung; nur die
+// Aggregate unten sind atomar.
+struct ContigSampler {
+    uint32_t lbEntry, lbMin, freeEntry, freeMin;
+    static uint32_t lb() { return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL); }
+    static uint32_t fr() { return (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL); }
+    ContigSampler() { lbEntry = lbMin = lb(); freeEntry = freeMin = fr(); }
+    void mark() {
+        uint32_t a = lb(); if (a < lbMin) lbMin = a;
+        uint32_t b = fr(); if (b < freeMin) freeMin = b;
+    }
+    void done(uint32_t bodyLen, bool ok) {
+        mark();
+        g_probeRuns.fetch_add(1, std::memory_order_relaxed);
+        if (!ok) g_probeFails.fetch_add(1, std::memory_order_relaxed);
+        uint32_t prev = g_probeLbWorst.load(std::memory_order_relaxed);
+        while (lbMin < prev && !g_probeLbWorst.compare_exchange_weak(prev, lbMin)) {}
+        uint32_t drop = lbEntry > lbMin ? lbEntry - lbMin : 0;
+        prev = g_probeLbDropMax.load(std::memory_order_relaxed);
+        while (drop > prev && !g_probeLbDropMax.compare_exchange_weak(prev, drop)) {}
+        uint32_t fdrop = freeEntry > freeMin ? freeEntry - freeMin : 0;
+        prev = g_probeFreeDropMax.load(std::memory_order_relaxed);
+        while (fdrop > prev && !g_probeFreeDropMax.compare_exchange_weak(prev, fdrop)) {}
+        prev = g_probeBodyMax.load(std::memory_order_relaxed);
+        while (bodyLen > prev && !g_probeBodyMax.compare_exchange_weak(prev, bodyLen)) {}
+    }
+};
+// Ballast: schneidet den groessten freien INTERNAL-Block gezielt klein, damit
+// sich die Feldlage (betateilchen: largest_block 15348) im Lab herstellen
+// laesst. Ohne das testet man nur "Floor niedrig, Heap riesig" = nichtssagend.
+std::vector<void*> g_ballast;
+void ballastFree() {
+    for (void* p : g_ballast) heap_caps_free(p);
+    g_ballast.clear();
+}
+void ballastTo(uint32_t target) {
+    ballastFree();
+    if (target == 0) return;
+    for (int i = 0; i < 64; ++i) {
+        uint32_t lb = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        if (lb <= target) break;
+        size_t take = lb - target;
+        if (take < 128) break;
+        // Harte Untergrenze: unter ~30 KB freiem INTERNAL-Heap stirbt der
+        // WiFi-/TCP-Stack mit. Lab-Vorfall 2026-07-30: ballast=8000 hat das
+        // Board getoetet und beim Reboot das NVS mitgenommen. Lieber das
+        // lb-Ziel verfehlen als das Board verlieren.
+        uint32_t freeNow = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (freeNow < 30000u || freeNow - take < 30000u) break;
+        void* p = heap_caps_malloc(take, MALLOC_CAP_INTERNAL);
+        if (!p) break;
+        g_ballast.push_back(p);
+    }
+}
+
+#define PROBE_SAMPLER(nm) ContigSampler nm
+#define PROBE_MARK(nm)    nm.mark()
+#define PROBE_DONE(nm, len, ok) nm.done((uint32_t)(len), (ok))
+#else
+#define PROBE_SAMPLER(nm) do {} while (0)
+#define PROBE_MARK(nm)    do {} while (0)
+#define PROBE_DONE(nm, len, ok) do {} while (0)
+#endif
+
 inline bool     outboundHasPsram()    { return ESP.getPsramSize() > 0; }
 // no-PSRAM-Floor 45K -> 30K (Lab .58 2026-07-17): 45K war auf die Vor-.32-Lage
 // ohne Outbound-Timeouts kalibriert. Seit .32 ist der Drain pro Handler auf
@@ -90,7 +174,34 @@ inline int      outboundMaxInflight() { return outboundHasPsram() ? 8 : 2; }
 // Contiguous-Bedarf der zwei leichten Live-Handler (HTTPClient-RX-Puffer +
 // getString()-Body von /presets bzw. /now_playing = wenige KB) — bewusst
 // GETRENNT vom total-free-Floor oben, siehe Guard-Kommentar (FHEM 144729 #153).
-inline uint32_t outboundBlockFloor()  { return 16000u; }
+//
+// 16000 -> 8000 (v0.8.38, Lab-gemessen 2026-07-30 auf c5-16mb gegen die echten
+// Speaker; Anlass: betateilchens C5-N16R8-Dump FHEM 144729 msg1367262 mit 27
+// von 27 Rejects aus GENAU diesem Zweig bei largest_block 15348):
+//   * Die Speaker antworten chunked OHNE Content-Length -> getString() kann
+//     nicht vorab reservieren, der String waechst per realloc. Groesster Body
+//     im Lab: /presets 1883 B, /now_playing 158 B.
+//   * Groesster gemessener contiguous ENTZUG pro Handler-Lauf: 6144 B
+//     (96 Laeufe seriell + 6er-Burst, 0 Fehler). Im engen Heap sogar nur
+//     0-2048 B — der Allokator bedient dann aus kleineren Bloecken, statt den
+//     groessten anzuschneiden.
+//   * Floor-Sweep bei kuenstlich auf 15348 gedruecktem largest_block:
+//     Floor 16000 -> 36/36 = 503 (VOLLSTAENDIGER Dauer-Reject, keine Spitze);
+//     Floor 8000/6000/4000 -> 60/60 = 200, null Fehler, null kaputte Bodies.
+//   Also: 16000 hat nicht die Allokation geschuetzt, sondern den Normalbetrieb
+//   auf fragmentierten PSRAM-Boards blockiert — dieselbe Fehlerklasse wie die
+//   .32-Regression, nur eine Stufe tiefer. 8000 deckt den 6144er-Worst-Case
+//   mit Luft und ist der einzige Guard-Wert, der bewusst NICHT mit PSRAM
+//   skaliert (der Check laeuft auf MALLOC_CAP_INTERNAL, PSRAM hilft dort
+//   per Konstruktion nicht — der Bedarf ist chip-unabhaengig, er haengt am
+//   Speaker-Body).
+//   NICHT gemessen: die Bruchstelle unterhalb largest_block ~15 K. Wer hier
+//   weiter senken will, misst das erst (Envs *-probe, /api/dbg/contig).
+#if SIXBACK_CONTIG_PROBE
+inline uint32_t outboundBlockFloor()  { return g_probeFloor.load(std::memory_order_relaxed); }
+#else
+inline uint32_t outboundBlockFloor()  { return 8000u; }
+#endif
 
 // FHEM 144729 (v0.8.32): kurze, empirisch abgesicherte Timeouts fuer die zwei
 // synchronen Live-Outbound-Handler. Lab-Messung (Kueche/Emma/Greta, wach):
@@ -374,6 +485,13 @@ void handleStatus(AsyncWebServerRequest* req) {
         pstore["load_ok"]    = !ps.loadFailedFromNvs();
         pstore["save_fails"] = ps.saveFails();
         pstore["speakers"]   = (uint32_t)ps.speakerCount();
+        // Ursachen-Aufschluesselung nur wenn ueberhaupt was schiefging —
+        // sonst Status-Noise fuer alle (gleiche Regel wie bei rej_floor_*).
+        // heap_aborts = transient (NVS intakt), nvs_fails = Kapazitaetskante.
+        if (ps.saveFails() > 0) {
+            pstore["save_heap_aborts"] = ps.saveHeapAborts();
+            pstore["save_nvs_fails"]   = ps.saveNvsFails();
+        }
     }
     // Analog fuer das Speaker-Inventory (hidden/order/ownership-Writes):
     // die Callsites antworten 200 auch bei NVS-Fail — der Zaehler macht das
@@ -2389,20 +2507,26 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
         if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
         spIp = sp->ip;
     }
+    PROBE_SAMPLER(pr);
     HTTPClient h;
     h.setReuse(false);
     h.setConnectTimeout(LIVE_OUT_CONNECT_MS);              // FHEM 144729: hatte KEIN
     h.setTimeout(LIVE_OUT_READ_MS);                        // Timeout -> Default ~5s Blockade
     String u = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/now_playing";
-    if (!h.begin(u)) { req->send(502, "application/json", "{\"error\":\"http begin failed\"}"); return; }
+    if (!h.begin(u)) { PROBE_DONE(pr, 0, false); req->send(502, "application/json", "{\"error\":\"http begin failed\"}"); return; }
+    PROBE_MARK(pr);
     int code = h.GET();
+    PROBE_MARK(pr);
     if (code != 200) {
         h.end();
+        PROBE_DONE(pr, 0, false);
         req->send(502, "application/json", String("{\"error\":\"speaker HTTP\",\"code\":") + code + "}");
         return;
     }
     String xml = h.getString();
+    PROBE_MARK(pr);
     h.end();
+    PROBE_DONE(pr, xml.length(), true);
 
     auto extractAttr = [&](const String& tag, const String& attr) -> String {
         int t = xml.indexOf("<" + tag);
@@ -2892,15 +3016,20 @@ struct HwSlotInfo_ {
 };
 
 static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
+    PROBE_SAMPLER(pr);
     HTTPClient h; h.setReuse(false);
     h.setConnectTimeout(LIVE_OUT_CONNECT_MS);   // FHEM 144729: Connect bounden
     h.setTimeout(LIVE_OUT_READ_MS);             // (toter Standby-Speaker -> kurz raus)
     String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/presets";
-    if (!h.begin(url)) return false;
+    if (!h.begin(url)) { PROBE_DONE(pr, 0, false); return false; }
+    PROBE_MARK(pr);
     int code = h.GET();
-    if (code != 200) { h.end(); return false; }
+    PROBE_MARK(pr);
+    if (code != 200) { h.end(); PROBE_DONE(pr, 0, false); return false; }
     String xml = h.getString();
+    PROBE_MARK(pr);
     h.end();
+    PROBE_DONE(pr, xml.length(), true);
     for (int slot = 1; slot <= 6; ++slot) {
         String tag = "<preset id=\"" + String(slot) + "\"";
         int idx = xml.indexOf(tag);
@@ -4342,12 +4471,58 @@ void handleStreamsImport(AsyncWebServerRequest* req, JsonDocument& body) {
     req->send(200, "application/json", s);
 }
 
+#if SIXBACK_CONTIG_PROBE
+// GET /api/dbg/contig[?floor=N][&reset=1] — Lab-Sonde (nur *-probe-Envs).
+//   floor=N  setzt outboundBlockFloor() zur Laufzeit (Floor-Sweep)
+//   reset=1  setzt die Aggregate zurueck (vor jedem Messlauf)
+void handleDbgContig(AsyncWebServerRequest* req) {
+    if (req->hasParam("floor")) {
+        uint32_t v = (uint32_t)req->getParam("floor")->value().toInt();
+        g_probeFloor.store(v, std::memory_order_relaxed);
+    }
+    if (req->hasParam("ballast")) {
+        // ballast=N -> groessten freien INTERNAL-Block auf ~N Bytes druecken,
+        // ballast=0 -> alles wieder freigeben.
+        ballastTo((uint32_t)req->getParam("ballast")->value().toInt());
+    }
+    if (req->hasParam("reset")) {
+        g_probeRuns.store(0);        g_probeFails.store(0);
+        g_probeLbWorst.store(0xFFFFFFFFu);
+        g_probeLbDropMax.store(0);   g_probeFreeDropMax.store(0);
+        g_probeBodyMax.store(0);
+        g_outboundRejects.store(0);  g_rejFloorTotal.store(0);
+        g_rejFloorBlock.store(0);    g_rejInflight.store(0);
+    }
+    JsonDocument d;
+    d["floor"]          = g_probeFloor.load();
+    d["runs"]           = g_probeRuns.load();
+    d["fails"]          = g_probeFails.load();
+    uint32_t w = g_probeLbWorst.load();
+    d["lb_worst"]       = (w == 0xFFFFFFFFu) ? 0 : w;   // kleinster largest_block im Handler
+    d["lb_drop_max"]    = g_probeLbDropMax.load();      // groesster contiguous-Entzug
+    d["free_drop_max"]  = g_probeFreeDropMax.load();
+    d["body_max"]       = g_probeBodyMax.load();
+    d["lb_now"]         = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    d["free_now"]       = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    JsonObject rej      = d["rejects"].to<JsonObject>();
+    rej["total"]        = g_outboundRejects.load();
+    rej["floor_total"]  = g_rejFloorTotal.load();
+    rej["floor_block"]  = g_rejFloorBlock.load();
+    rej["inflight"]     = g_rejInflight.load();
+    String s; serializeJson(d, s);
+    req->send(200, "application/json", s);
+}
+#endif
+
 void registerApiEndpoints(AsyncWebServer& ui) {
     // Statische Assets aus LittleFS (CSS, JS, etc.)
     ui.serveStatic("/assets/", LittleFS, "/assets/").setCacheControl("max-age=600");
 
     ui.on("/",                        HTTP_GET,    handleRoot);
     ui.on("/api/status",              HTTP_GET,    handleStatus);
+#if SIXBACK_CONTIG_PROBE
+    ui.on("/api/dbg/contig",          HTTP_GET,    handleDbgContig);
+#endif
     ui.on("/api/speakers",            HTTP_GET,    handleSpeakersList);
     ui.on("/api/speakers/discover",   HTTP_POST,   handleDiscover);
     routeJsonBody(ui, "/api/speakers/add", HTTP_POST, handleSpeakerAdd);

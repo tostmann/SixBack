@@ -162,6 +162,10 @@
                        font-weight: 600; margin-bottom: .15em; }
   .preset .slot-edit-badge { color: var(--warn); font-weight: 700; font-size: .9em; }
   .preset .slot-synced-badge { color: var(--ok); font-weight: 600; }
+  /* hardware state unknown (speaker did not answer) — deliberately muted, not
+     alarming: nothing is broken, the probe just has not come back yet. */
+  .preset .slot-hw-unknown-badge { color: var(--mute); font-weight: 600;
+                                   font-size: .85em; font-style: italic; }
   .preset .slot-spot-badge { cursor: pointer; font-size: 1em; padding: 0 .25em;
                              border-radius: 3px; user-select: none;
                              transition: opacity .15s, background .15s; }
@@ -1948,6 +1952,16 @@ function speakerCard(s, myBase) {
 // then convinced the auto-import block that the store was "empty" — leading
 // it to silently overwrite a just-dropped slot with hardware state. The
 // error-shape detection below bails BEFORE touching STATE in that case.
+//
+// The SAME trap existed on the hardware side until 2026-08-02 (FHEM 144729
+// #196): `/hardware-presets` answers 502 when the speaker times out, api()
+// throws, hwR becomes {error} — and `hwR.slots || []` then rendered as
+// "on speaker: (empty)" WITH a push button, i.e. the UI claimed the speaker
+// had lost its presets when it had merely not answered in time. With several
+// speakers polled in parallel this hit a rotating one or two of them, and it
+// healed on the next successful fetch (which is why it looked like a race).
+// Now: keep the last known hardware state, mark the device unreachable, and
+// let presetCard() say so instead of inventing an empty speaker.
 async function loadPresetsFor(devId) {
   try {
     const [storeR, hwR] = await Promise.all([
@@ -1958,34 +1972,57 @@ async function loadPresetsFor(devId) {
     // good state in STATE.presetsByDev[devId], retry once after 600ms.
     if (storeR && storeR.error) {
       console.warn('loadPresetsFor: store fetch failed for', devId, '—', storeR.error);
-      STATE._presetsRetry = STATE._presetsRetry || {};
-      if (!STATE._presetsRetry[devId]) {
-        STATE._presetsRetry[devId] = true;
-        setTimeout(() => { delete STATE._presetsRetry[devId]; loadPresetsFor(devId); }, 600);
-      }
+      schedulePresetsRetry_(devId);
       return;
     }
+    // hwOk is TRUE only on an explicit ok:true from the backend. A thrown
+    // fetch ({error}) and an ok:false body both count as "unknown", never as
+    // "the speaker is empty".
+    const hwOk  = !!(hwR && hwR.ok === true);
+    const prior = STATE.presetsByDev[devId];
+    let hwSlots;
+    if (hwOk) {
+      hwSlots = normalizeHwSlots_(hwR.slots || [], true);
+    } else {
+      console.warn('loadPresetsFor: hw fetch failed for', devId, '—',
+                   (hwR && hwR.error) || 'ok:false');
+      // Reuse the last good reading if we ever had one; otherwise 6 blank
+      // slots flagged unreachable (presetCard renders that as "unknown").
+      hwSlots = (prior && prior.hw && prior.hw.length)
+              ? prior.hw
+              : normalizeHwSlots_([], false);
+      schedulePresetsRetry_(devId);
+    }
     let storeSlots = normalizeStoreSlots_(storeR.presets || []);
-    const hwSlots  = normalizeHwSlots_(hwR && hwR.slots || [], hwR && hwR.ok);
     // First-contact import: if store empty, pull from hardware.
     // Only allowed when there's NO prior STATE for this device (== true cold
     // start). Once we've already populated presetsByDev[devId] once, any
     // subsequent "all empty" reading must be authoritative — otherwise a
     // user-initiated clear-all gets silently undone by re-import.
+    // Requires a FRESH hardware reading (hwOk): importing from a stale or
+    // unknown hw state would write yesterday's presets back into the store.
     const storeAllEmpty = storeSlots.every(s => isSlotEmpty_(s));
-    const hadPriorState = !!STATE.presetsByDev[devId];
-    if (!hadPriorState && storeAllEmpty && hwSlots.length && !hwSlots.every(s => isSlotEmpty_(s))) {
+    const hadPriorState = !!prior;
+    if (hwOk && !hadPriorState && storeAllEmpty &&
+        hwSlots.length && !hwSlots.every(s => isSlotEmpty_(s))) {
       try {
         const ir = await api('/api/speaker/'+encodeURIComponent(devId)+'/presets/import-from-device',
                               {method:'POST'});
-        if (ir.count > 0) {
+        // persisted:false = landed in RAM only (NVS save failed). Say so once
+        // instead of leaving the user with a silently non-durable store; the
+        // backend stops auto-retrying this device until a save succeeds.
+        if (ir && ir.persisted === false && !ir.skipped) {
+          toast('Imported presets could not be saved to flash — they are ' +
+                'lost on the next reboot. See ⚠ store in the header.');
+        }
+        if (ir && ir.count > 0) {
           const r2 = await api('/api/speaker/'+encodeURIComponent(devId)+'/presets');
           storeSlots = normalizeStoreSlots_(r2.presets || []);
         }
       } catch(_) {}
     }
     STATE.presetsByDev[devId] = { store: storeSlots, hw: hwSlots,
-                                   hwReachable: hwR && hwR.ok !== false, loadedAt: Date.now() };
+                                   hwReachable: hwOk, loadedAt: Date.now() };
     renderSpeakerSlots(devId);
     // Index slots for fast now-playing match lookups
     STATE.slotIndex = STATE.slotIndex || {};
@@ -1993,6 +2030,15 @@ async function loadPresetsFor(devId) {
     applyPlayingHighlight(devId);
     updatePushVisibility(devId);
   } catch(e) { console.warn('loadPresetsFor outer:', e.message); }
+}
+
+// One pending retry per device — a failed store OR hardware fetch schedules
+// it; the flag makes concurrent failures collapse into a single retry.
+function schedulePresetsRetry_(devId) {
+  STATE._presetsRetry = STATE._presetsRetry || {};
+  if (STATE._presetsRetry[devId]) return;
+  STATE._presetsRetry[devId] = true;
+  setTimeout(() => { delete STATE._presetsRetry[devId]; loadPresetsFor(devId); }, 600);
 }
 
 // Optimistic store-side patch — call right after a successful PUT on a slot
@@ -2120,7 +2166,11 @@ function presetCard(devId, slotNum) {
   const hw    = d.hw[slotNum-1]    || {source:''};
   const storeEmpty = isSlotEmpty_(store);
   const hwEmpty    = isSlotEmpty_(hw);
-  const synced     = slotsMatch_(store, hw);
+  // Speaker did not answer the /hardware-presets probe and we have no earlier
+  // reading for this slot: its hardware state is UNKNOWN, not empty. Claiming
+  // "(empty)" here is what produced the phantom push buttons (FHEM 144729 #196).
+  const hwUnknown  = (d.hwReachable === false) && hwEmpty;
+  const synced     = hwUnknown ? false : slotsMatch_(store, hw);
   const opaque     = (store.source === 'OPAQUE');
 
   // Drag: only when store has a non-empty, non-OPAQUE entry to drag away.
@@ -2137,11 +2187,12 @@ function presetCard(devId, slotNum) {
 
   let cls = 'preset';
   if (opaque) cls += ' opaque';
-  if (storeEmpty && hwEmpty) cls += ' empty';
+  if (storeEmpty && hwEmpty && !hwUnknown) cls += ' empty';
 
   // Header line: slot number + edit/sync badge + Spotify badge
   let badge = '';
-  if (storeEmpty && hwEmpty)  badge = '';
+  if (hwUnknown)              badge = '<span class="slot-hw-unknown-badge" title="The speaker did not answer — its current preset is unknown, not empty. Retrying automatically.">speaker not reachable</span>';
+  else if (storeEmpty && hwEmpty)  badge = '';
   else if (synced)            badge = '<span class="slot-synced-badge">✓ synced</span>';
   else                        badge = '<span class="slot-edit-badge">✏ unsaved</span>';
   // Spotify-Badge in der Slot-Card wurde entfernt — Library-Edit passiert
@@ -2192,7 +2243,22 @@ function presetCard(devId, slotNum) {
     : '';
 
   let body;
-  if (storeEmpty && hwEmpty) {
+  if (hwUnknown) {
+    // Show what WE have, state the speaker side as unknown, and offer no push
+    // button — pushing against an unread speaker is guesswork, and the whole
+    // point of this branch is not to pretend we know its state.
+    body =
+      `<div class="slot-row hw">` +
+        `<span class="row-label">on speaker</span>` +
+        `<span class="row-name empty">(not reachable — retrying)</span>` +
+      `</div>` +
+      `<div class="slot-row store">` +
+        `<span class="row-label">you set</span>` +
+        slotIcon_(store, false) +
+        `<span class="row-name${storeEmpty ? ' empty' : ''}">${esc(storeEmpty ? '(nothing stored)' : slotName_(store))}</span>` +
+      `</div>` +
+      spotLabel;
+  } else if (storeEmpty && hwEmpty) {
     body = spotLabel
          ? spotLabel + `<div class="slot-hint" style="font-size:.8em;color:var(--mute);margin-top:.3em">click to trigger</div>`
          : `<div class="slot-empty-drop">＋ drop a TuneIn tile here</div>`;

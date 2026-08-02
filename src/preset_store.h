@@ -136,6 +136,13 @@ public:
     // ohne sie ist "save_fails: 1" im Feld nicht bewertbar.
     uint32_t saveHeapAborts() const    { return saveHeapAborts_; }
     uint32_t saveNvsFails() const      { return saveNvsFails_; }
+    // Monoton steigend bei JEDEM erfolgreichen saveToNVS. Dient als
+    // "hat sich an der NVS-Lage etwas gebessert?"-Generation: der
+    // Auto-Import-Backoff (api_endpoints.cpp) verwirft seine Sperrliste,
+    // sobald irgendein Save wieder durchkam — sonst bliebe ein einmal
+    // gescheiterter Import bis zum Reboot gesperrt, auch nachdem der
+    // User Platz geschaffen hat.
+    uint32_t saveOkCount() const       { return saveOkCount_; }
     // Anzahl Speaker-Eintraege im Store (Boot-Forensik: wie viele Slices
     // der Load tatsaechlich geliefert hat).
     size_t   speakerCount();
@@ -160,6 +167,7 @@ private:
     uint32_t saveFails_  = 0;       // saveToNVS-Fehlschlaege seit Boot (Summe)
     uint32_t saveHeapAborts_ = 0;   // davon: JsonDocument-Overflow (transient)
     uint32_t saveNvsFails_   = 0;   // davon: echter NVS-Schreibfehler
+    uint32_t saveOkCount_    = 0;   // erfolgreiche saveToNVS seit Boot
 };
 
 const char* presetSourceToStr(PresetSource s);

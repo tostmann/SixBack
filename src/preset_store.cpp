@@ -220,6 +220,7 @@ bool PresetStore::saveToNVS() {
         // Erfolgreicher Save ersetzt einen ggf. defekten Boot-Blob ->
         // Load-Fail-Zustand ist damit geheilt, /full darf wieder servieren.
         loadFailed_ = false;
+        ++saveOkCount_;             // Generation fuer den Auto-Import-Backoff
     } else {
         // Zentrale Zaehlung fuer ALLE Caller — clear()/syncToGroup()
         // ignorierten das Ergebnis bis 2026-07-17 komplett (silent loss).

@@ -705,7 +705,7 @@ struct MigrateJob_ {
 // ersten Sync seinen Local-Cache.
 int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
                               int& httpCodeOut, JsonArray imported,
-                              JsonArray abandoned);
+                              JsonArray abandoned, bool* persistedOut = nullptr);
 
 void migrateRevertWorker_(void* arg) {
     auto* job = static_cast<MigrateJob_*>(arg);
@@ -1282,9 +1282,10 @@ void handleRevertPresetToHw(AsyncWebServerRequest* req) {
 //   502 = speaker http != 200 (httpCodeOut gefuellt)
 int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
                               int& httpCodeOut, JsonArray imported,
-                              JsonArray abandoned) {
+                              JsonArray abandoned, bool* persistedOut) {
     countOk = countAban = 0;
     httpCodeOut = 0;
+    if (persistedOut) *persistedOut = true;   // "nichts zu schreiben" gilt als ok
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1378,20 +1379,83 @@ int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
     // (z.B. eben durch eine voraus-fehlgeschlagene Migration), setSlots-mit-
     // leerem-vector wuerde unseren Store auch leer machen. Deshalb nur dann
     // schreiben wenn was gefunden wurde — sonst Store unveraendert lassen.
+    //
+    // Der Rueckgabewert von setSlots() wurde bis 2026-08-02 verworfen: ein an
+    // der NVS-Kante gescheiterter Save meldete dem Aufrufer trotzdem 200, der
+    // Store hielt die Presets nur noch im RAM (weg beim naechsten Boot) — und
+    // die UI wusste nichts davon (FHEM 144729 #196). Jetzt durchgereicht.
     if (!toSet.empty()) {
-        sixback::PresetStore::instance().setSlots(id, toSet);
+        bool saved = sixback::PresetStore::instance().setSlots(id, toSet);
+        if (persistedOut) *persistedOut = saved;
+        if (!saved) {
+            Serial.printf("[import] %s: %u Presets im RAM, aber NVS-Persist "
+                          "FEHLGESCHLAGEN\n", id.c_str(), (unsigned)toSet.size());
+        }
     }
     return 200;
 }
 
+// Auto-Import-Backoff (FHEM 144729 #196, 2026-08-02)
+// ---------------------------------------------------
+// Der First-Contact-Auto-Import der WebUI feuert bei JEDEM frischen Seiten-
+// aufbau fuer jeden Speaker, dessen Store-Slice leer ist. saveToNVS() schreibt
+// dabei IMMER den kompletten Store-Blob (alle Slices) — bei einem Nutzer mit
+// vielen Boxen also einen grossen Write, und wenn der an der NVS-Kante
+// scheitert, bleibt der Slice leer => beim naechsten Reload derselbe
+// Voll-Blob-Write, samt Cleanup-Kaskade, die dabei regenerable Namespaces
+// (sixback-tune/-sys) purgt. Ein Reload-Zyklus wurde so zum Write-Verstaerker.
+// Deshalb: gescheiterter Persist sperrt weitere AUTO-Importe fuer dieses
+// Device — bis irgendein Save wieder durchkommt (saveOkCount aendert sich,
+// z.B. weil der User Platz geschaffen hat) oder bis zum Reboot.
+namespace {
+std::vector<String> g_importPersistFailed;
+uint32_t            g_importFailedAtSaveOk = 0;
+
+// Sperrliste verwerfen, sobald wieder ein Save durchkam.
+void importBackoffSync_() {
+    uint32_t okNow = sixback::PresetStore::instance().saveOkCount();
+    if (okNow != g_importFailedAtSaveOk) {
+        if (!g_importPersistFailed.empty()) {
+            Serial.printf("[import] NVS-Save wieder erfolgreich — Auto-Import-Sperre "
+                          "fuer %u Device(s) aufgehoben\n",
+                          (unsigned)g_importPersistFailed.size());
+        }
+        g_importPersistFailed.clear();
+        g_importFailedAtSaveOk = okNow;
+    }
+}
+bool importBackoffBlocked_(const String& id) {
+    importBackoffSync_();
+    for (const auto& d : g_importPersistFailed) if (d == id) return true;
+    return false;
+}
+void importBackoffMark_(const String& id) {
+    for (const auto& d : g_importPersistFailed) if (d == id) return;
+    g_importPersistFailed.push_back(id);
+    g_importFailedAtSaveOk = sixback::PresetStore::instance().saveOkCount();
+}
+}  // namespace
+
 void handleImportFromDevice(AsyncWebServerRequest* req) {
     String id = pathParam(0);
+    // Bereits gescheitert und seither kein erfolgreicher Save: gar nicht erst
+    // versuchen. 200 (nicht 5xx), damit der Auto-Pfad in der UI still bleibt —
+    // die Diagnose steht in preset_store.save_fails + im Serial-Log.
+    if (importBackoffBlocked_(id)) {
+        req->send(200, "application/json",
+                  "{\"ok\":false,\"count\":0,\"persisted\":false,"
+                  "\"skipped\":\"backoff\","
+                  "\"error\":\"previous import could not be persisted (NVS) — "
+                  "not retried until a save succeeds\"}");
+        return;
+    }
     JsonDocument resp;
     JsonArray imported  = resp["imported"].to<JsonArray>();
     JsonArray abandoned = resp["abandoned"].to<JsonArray>();
     int countOk = 0, countAban = 0, httpCode = 0;
+    bool persisted = true;
     int status = importPresetsFromSpeaker_(id, countOk, countAban, httpCode,
-                                            imported, abandoned);
+                                            imported, abandoned, &persisted);
     if (status == 404) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
     if (status == 500) { req->send(500, "application/json", "{\"error\":\"http begin\"}");      return; }
     if (status == 502) {
@@ -1399,9 +1463,15 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
                   String("{\"error\":\"speaker http ") + httpCode + "\"}");
         return;
     }
-    resp["ok"]              = true;
+    if (!persisted) importBackoffMark_(id);
+    resp["ok"]              = persisted;
+    resp["persisted"]       = persisted;
     resp["count"]           = countOk;
     resp["abandoned_count"] = countAban;
+    if (!persisted) {
+        resp["error"] = "imported into RAM but NVS save failed — "
+                        "presets are not reboot-safe yet";
+    }
     String body; serializeJson(resp, body);
     req->send(200, "application/json", body);
 }

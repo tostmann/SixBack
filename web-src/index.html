@@ -236,10 +236,20 @@
 
   .toast { position: fixed; bottom: 1em; right: 1em;
            background: var(--accent); color: #fff; padding: .7em 1em;
-           border-radius: 6px; opacity: 0; transition: opacity .2s; z-index: 200; max-width: 28em; }
-  .toast.show { opacity: 1; }
+           border-radius: 6px; opacity: 0; transition: opacity .2s; z-index: 200; max-width: 28em;
+           /* A faded-out toast keeps its last message and its box, so without
+              this it goes on swallowing clicks meant for whatever sits under
+              the bottom-right corner. */
+           pointer-events: none; }
+  .toast.show { opacity: 1; pointer-events: auto; }
   .toast.error { background: var(--bad); }
   .toast.success { background: var(--ok); }
+  /* Sticky (error) toasts wait for the user instead of timing out. */
+  .toast.sticky { display: flex; align-items: flex-start; gap: .6em; cursor: pointer; }
+  .toast-x { background: none; border: 0; color: inherit; font: inherit;
+             font-size: 1.15em; line-height: 1.1; cursor: pointer; padding: 0;
+             opacity: .75; flex: none; }
+  .toast-x:hover { opacity: 1; }
   pre { background: #f0ede4; padding: .6em; border-radius: 4px; font-size: .8em;
         overflow: auto; max-height: 14em; }
   details { margin-top: .5em; }
@@ -758,6 +768,22 @@
   </span>
 </div>
 
+<div class="automode-bar" id="stickyerr-bar" style="margin-top:1em">
+  <span class="label">Keep error messages on screen:</span>
+  <label class="switch" title="On by default — error messages wait for you instead of disappearing after 4 seconds">
+    <input type="checkbox" id="se-toggle" onchange="toggleStickyErrors(this.checked)">
+    <span class="slider"></span>
+  </label>
+  <span class="pill" id="se-pill">…</span>
+  <span class="detail">
+    On by default: a red error message stays until you click it away (or click
+    the <code>×</code>), so a warning like <i>presets could not be written to
+    flash</i> can't vanish before you have read it. Switch off and errors
+    disappear after 4 seconds again, like the green ones. This is a setting of
+    <b>this browser</b>, not of the stick — it is not stored on the device.
+  </span>
+</div>
+
 <div class="automode-bar" id="hostname-bar" style="margin-top:1em">
   <span class="label">Hostname (.local):</span>
   <input type="text" id="host-input" maxlength="24" pattern="[a-z0-9-]+"
@@ -964,27 +990,70 @@ let STATIONS_API_BASE = STATIONS_API_BASES[0];   // updated to whichever base ac
 // Dedup: identical msg+kind within DEDUP_MS is treated as the same event —
 // we refresh the on-screen toast lifetime but don't blink/restack it. This
 // kills the spam wave when transient backend errors fire on every poll-tick.
+//
+// Errors do NOT auto-dismiss (FHEM 144729 #199). The message that mattered
+// most so far — "imported presets could not be saved to flash" — was gone
+// before the reporter had finished reading it, and it announces a consequence
+// that outlives the message itself (the presets are not reboot-safe). So an
+// error stays until the user dismisses it, or until the next toast replaces
+// it; there is only ever one toast element, so nothing stacks up. Every error
+// toast is raised from a user action (a click, a drop, a file pick) — none
+// fire from a poll tick — so a sticky error cannot turn into a permanent
+// fixture nobody asked for. Success/info keep the 4 s cadence.
+//
+// If it does get in the way, System → "Keep error messages on screen" turns it
+// off and errors go back to the 4 s cadence. That preference is per browser
+// (localStorage), NOT device state: it says nothing about the speakers, and a
+// display preference has no business spending NVS entries on a device that can
+// run out of them.
 const TOAST_DEDUP_MS = 8000;
+const TOAST_AUTO_MS  = 4000;
+const STICKY_ERR_KEY = 'SIXBACK_STICKY_ERRORS';
 let _lastToastKey = '';
 let _lastToastAt  = 0;
+function stickyErrorsOn_() {                       // default ON, '0' opts out
+  try { return localStorage.getItem(STICKY_ERR_KEY) !== '0'; } catch (e) { return true; }
+}
+function toastSticky_(kind) { return kind === 'error' && stickyErrorsOn_(); }
+function toastDismiss_() {
+  clearTimeout(window._toastT);
+  const t = document.getElementById('toast');
+  if (t) t.className = 'toast';
+}
 function toast(msg, kind='success') {
   const key = kind + '|' + msg;
   const now = Date.now();
+  const sticky = toastSticky_(kind);
   if (key === _lastToastKey && (now - _lastToastAt) < TOAST_DEDUP_MS) {
     _lastToastAt = now;                                  // extend window
     clearTimeout(window._toastT);
-    window._toastT = setTimeout(() => {
-      document.getElementById('toast').className = 'toast';
-    }, 4000);
+    // A repeat of a sticky error changes nothing: it is already on screen and
+    // still waiting for the user.
+    if (!sticky) window._toastT = setTimeout(toastDismiss_, TOAST_AUTO_MS);
     return;
   }
   _lastToastKey = key;
   _lastToastAt  = now;
   const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast show ' + kind;
+  // Build via DOM, not innerHTML — msg carries backend strings and file names.
+  t.textContent = '';
+  const body = document.createElement('span');
+  body.textContent = msg;
+  t.appendChild(body);
+  if (sticky) {
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'toast-x';
+    x.title = 'dismiss';
+    x.setAttribute('aria-label', 'dismiss');
+    x.textContent = '×';
+    x.addEventListener('click', e => { e.stopPropagation(); toastDismiss_(); });
+    t.appendChild(x);
+  }
+  t.onclick = sticky ? toastDismiss_ : null;
+  t.className = 'toast show ' + kind + (sticky ? ' sticky' : '');
   clearTimeout(window._toastT);
-  window._toastT = setTimeout(() => { t.className = 'toast'; }, 4000);
+  if (!sticky) window._toastT = setTimeout(toastDismiss_, TOAST_AUTO_MS);
 }
 
 // ---- HTTP helpers ----
@@ -1111,6 +1180,7 @@ async function loadStatus() {
   loadDiagShare();
   loadUiAuth();
   loadHostname();
+  loadStickyErrors();
 }
 
 // ---- Auto-Mode toggle ----
@@ -1200,6 +1270,32 @@ async function toggleDiagShare(en) {
              : 'Diagnostic sharing disabled', 'success');
   } catch (e) { toast('Diag-Share toggle failed: '+e.message, 'error'); }
   loadDiagShare();
+}
+
+// ---- Sticky error messages (browser-local, see the Toast section) ----
+// No backend call: this is a per-browser display preference. Reflecting it on
+// every status tick keeps the switch honest if the panel gets re-rendered.
+function loadStickyErrors() {
+  const bar    = document.getElementById('stickyerr-bar');
+  const toggle = document.getElementById('se-toggle');
+  const pill   = document.getElementById('se-pill');
+  if (!bar || !toggle || !pill) return;
+  const on = stickyErrorsOn_();
+  toggle.checked = on;
+  bar.classList.toggle('on',  on);
+  bar.classList.toggle('off', !on);
+  pill.className   = 'pill ' + (on ? 'migrated_us' : 'unknown');
+  pill.textContent = on ? 'ON' : 'OFF';
+}
+
+function toggleStickyErrors(on) {
+  try { localStorage.setItem(STICKY_ERR_KEY, on ? '1' : '0'); } catch (e) {}
+  // Switching it off while an error is stuck on screen should clear that one
+  // too — otherwise the setting appears not to work until the next message.
+  if (!on) toastDismiss_();
+  loadStickyErrors();
+  toast(on ? 'Error messages stay until you dismiss them'
+           : 'Error messages disappear after 4 seconds again', 'success');
 }
 
 // ---- Konfigurierbarer mDNS-Hostname (Zwei-Stick-Betrieb) ----
@@ -1983,6 +2079,7 @@ async function loadPresetsFor(devId) {
     let hwSlots;
     if (hwOk) {
       hwSlots = normalizeHwSlots_(hwR.slots || [], true);
+      clearPresetsRetry_(devId);      // both sides healthy — reset the cadence
     } else {
       console.warn('loadPresetsFor: hw fetch failed for', devId, '—',
                    (hwR && hwR.error) || 'ok:false');
@@ -2013,7 +2110,7 @@ async function loadPresetsFor(devId) {
         // backend stops auto-retrying this device until a save succeeds.
         if (ir && ir.persisted === false && !ir.skipped) {
           toast('Imported presets could not be saved to flash — they are ' +
-                'lost on the next reboot. See ⚠ store in the header.');
+                'lost on the next reboot. See ⚠ store in the header.', 'error');
         }
         if (ir && ir.count > 0) {
           const r2 = await api('/api/speaker/'+encodeURIComponent(devId)+'/presets');
@@ -2034,11 +2131,32 @@ async function loadPresetsFor(devId) {
 
 // One pending retry per device — a failed store OR hardware fetch schedules
 // it; the flag makes concurrent failures collapse into a single retry.
+//
+// The retry must not stay fast forever. A speaker that is switched off fails
+// its probe every single time, and each retry is a real outbound request (the
+// response cache only holds successes). On a no-PSRAM chip, where one outbound
+// read runs at a time, a couple of permanently offline speakers would occupy
+// that slot several times a second and inflate `outbound_rejects` /
+// `rej_inflight` — the very counters used to diagnose field reports. So: three
+// quick attempts to ride out a genuine blip, then back off to a slow poll that
+// still recovers on its own once the speaker returns.
+const PRESETS_RETRY_FAST_N  = 3;
+const PRESETS_RETRY_FAST_MS = 600;
+const PRESETS_RETRY_SLOW_MS = 30000;
 function schedulePresetsRetry_(devId) {
-  STATE._presetsRetry = STATE._presetsRetry || {};
+  STATE._presetsRetry  = STATE._presetsRetry  || {};
+  STATE._presetsRetryN = STATE._presetsRetryN || {};
   if (STATE._presetsRetry[devId]) return;
+  const n = (STATE._presetsRetryN[devId] || 0) + 1;
+  STATE._presetsRetryN[devId] = n;
+  const delay = n <= PRESETS_RETRY_FAST_N ? PRESETS_RETRY_FAST_MS : PRESETS_RETRY_SLOW_MS;
   STATE._presetsRetry[devId] = true;
-  setTimeout(() => { delete STATE._presetsRetry[devId]; loadPresetsFor(devId); }, 600);
+  setTimeout(() => { delete STATE._presetsRetry[devId]; loadPresetsFor(devId); }, delay);
+}
+// Called once both fetches came back clean, so a speaker that returns after an
+// outage goes back to the fast cadence for the next unrelated blip.
+function clearPresetsRetry_(devId) {
+  if (STATE._presetsRetryN) delete STATE._presetsRetryN[devId];
 }
 
 // Optimistic store-side patch — call right after a successful PUT on a slot
@@ -2350,7 +2468,7 @@ async function onPresetClick(ev, devId, slot) {
                   {method:'POST'});
         toast(`▶ Spotify: ${spot.name || spot.uri}`);
       } catch(e) {
-        toast('Spotify trigger failed: '+e.message);
+        toast('Spotify trigger failed: '+e.message, 'error');
       }
       return;
     }
@@ -2394,7 +2512,7 @@ async function onPresetClick(ev, devId, slot) {
     toast(`▶ ${slotName_(hw)} on slot ${slot}`);
     kickPoll(devId);
   } catch(e) {
-    toast('Play failed: '+e.message);
+    toast('Play failed: '+e.message, 'error');
   }
 }
 
@@ -2647,7 +2765,7 @@ function onPresetDragLeave(ev) {
 // ---- Apply a preset payload (from cross-window drag, file drop, etc.) ----
 async function applyExternalPreset(payload, dst) {
   if (!payload || payload.sixback_preset !== 1) {
-    toast('Drop ignored — not a SixBack preset payload');
+    toast('Drop ignored — not a SixBack preset payload', 'error');
     return;
   }
   if (payload.source === 'OPAQUE') {
@@ -2655,7 +2773,7 @@ async function applyExternalPreset(payload, dst) {
     return;
   }
   if (!payload.source || payload.source === 'EMPTY') {
-    toast('Drop ignored — empty payload');
+    toast('Drop ignored — empty payload', 'error');
     return;
   }
   try {
@@ -2691,10 +2809,10 @@ async function applyExternalPreset(payload, dst) {
       loadPresetsFor(dst.dev);
       kickPoll(dst.dev);
     } else {
-      toast('Import failed: '+(r && r.error || 'unknown'));
+      toast('Import failed: '+(r && r.error || 'unknown'), 'error');
     }
   } catch(e) {
-    toast('Import failed: '+e.message);
+    toast('Import failed: '+e.message, 'error');
   }
 }
 
@@ -2747,7 +2865,7 @@ async function onPresetDrop(ev) {
       try {
         const text = await f.text();
         return applyExternalPreset(JSON.parse(text), dst);
-      } catch(e) { toast('Dropped file is not a SixBack preset JSON'); return; }
+      } catch(e) { toast('Dropped file is not a SixBack preset JSON', 'error'); return; }
     }
     return;
   }
@@ -2794,10 +2912,10 @@ async function onPresetDrop(ev) {
         loadPresetsFor(dst.dev);
         kickPoll(dst.dev);
       } else {
-        toast('Set failed: '+(r && r.error || 'unknown'));
+        toast('Set failed: '+(r && r.error || 'unknown'), 'error');
       }
     } catch (e) {
-      toast('Set failed: '+e.message);
+      toast('Set failed: '+e.message, 'error');
     }
     return;
   }
@@ -2871,10 +2989,10 @@ async function onPresetDrop(ev) {
       loadPresetsFor(src.dev);
       kickPoll(src.dev);
     } else {
-      toast('Swap failed: '+(r && r.error || 'unknown'));
+      toast('Swap failed: '+(r && r.error || 'unknown'), 'error');
     }
   } catch (e) {
-    toast('Swap failed: '+e.message);
+    toast('Swap failed: '+e.message, 'error');
   }
 }
 
@@ -2893,9 +3011,9 @@ function kickPoll(devId) {
 async function sendKey(devId, keyName) {
   try {
     const r = await api(`/api/speaker/${encodeURIComponent(devId)}/key/${keyName}`, {method:'POST'});
-    if (!(r && r.ok)) toast(`${keyName} failed: ${(r && r.error) || 'unknown'}`);
+    if (!(r && r.ok)) toast(`${keyName} failed: ${(r && r.error) || 'unknown'}`, 'error');
   } catch(e) {
-    toast(`${keyName} failed: ${e.message}`);
+    toast(`${keyName} failed: ${e.message}`, 'error');
   }
   kickPoll(devId);
 }
@@ -3094,7 +3212,7 @@ async function groupWith(devId) {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ master: devId, members: [slave] }),
     });
-  } catch(e) { toast('Group failed: ' + e.message); }
+  } catch(e) { toast('Group failed: ' + e.message, 'error'); }
   kickPollZone([devId, slave]);
 }
 
@@ -3107,7 +3225,7 @@ async function ungroupZone(devId) {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ master: z && z.masterId ? z.masterId : devId }),
     });
-  } catch(e) { toast('Ungroup failed: ' + e.message); }
+  } catch(e) { toast('Ungroup failed: ' + e.message, 'error'); }
   kickPollZone(affected);
 }
 
@@ -3276,7 +3394,7 @@ async function renameSpeaker(devId) {
         toast('Rename not confirmed yet — the speaker takes a few seconds to apply it. Hit Refresh; if the name does not change, check the speaker is online.', 'error');
       }
     }, 8000);
-  } catch (e) { toast('Rename failed: ' + e.message); }
+  } catch (e) { toast('Rename failed: ' + e.message, 'error'); }
 }
 
 async function stereoPair(devId) {
@@ -3288,7 +3406,7 @@ async function stereoPair(devId) {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ partner }),
     });
-  } catch(e) { toast('Stereo pair failed: ' + e.message); }
+  } catch(e) { toast('Stereo pair failed: ' + e.message, 'error'); }
   kickPollStereo([devId, partner]);
 }
 
@@ -3298,7 +3416,7 @@ async function stereoUnpair(devId) {
   if (v && v.roles) v.roles.forEach(r => { if (r.deviceId) affected.push(r.deviceId); });
   try {
     await api(`/api/speaker/${encodeURIComponent(devId)}/stereo-pair`, { method:'DELETE' });
-  } catch(e) { toast('Unpair failed: ' + e.message); }
+  } catch(e) { toast('Unpair failed: ' + e.message, 'error'); }
   kickPollStereo(affected);
 }
 
@@ -3386,7 +3504,7 @@ async function pushAllPresets(devId) {
     progressDone(); return;
   }
   if (!info || !info.ok) {
-    toast('Push failed: '+(info && info.error || 'unknown'));
+    toast('Push failed: '+(info && info.error || 'unknown'), 'error');
     progressDone(); return;
   }
   const eta = (info.eta_seconds || (toPush.length * 13));

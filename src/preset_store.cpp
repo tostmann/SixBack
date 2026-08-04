@@ -4,6 +4,8 @@
 #include "speaker_inventory.h"
 #include "tunein_resolver.h"   // tuneInLogoUrl() — kanonische TuneIn-Logo-URL
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <nvs.h>
 #include "mbedtls/base64.h"
 #include <vector>
 
@@ -12,7 +14,70 @@ namespace sixback {
 namespace {
 
 constexpr const char* NVS_NS  = "sixback-pre";
-constexpr const char* NVS_KEY = "presets";
+// Legacy-Gesamtblob (<= v0.8.39): ALLE Speaker in EINEM Key. Wird seit der
+// Per-Speaker-Umstellung nur noch als Migrationsquelle gelesen und nach
+// erfolgreicher Migration geloescht. ACHTUNG Downgrade-Kaskade: eine
+// Firmware <= v0.8.39 sieht nach der Migration einen leeren Store und
+// re-importiert beim naechsten Seitenaufbau von den Boxen (Presets auf den
+// Geraeten bleiben unberuehrt) — bewusster Trade-off, dokumentiert im
+// Release.
+constexpr const char* LEGACY_KEY = "presets";
+
+// true fuer den Legacy-Key und seine A/B-Geschwister — die duerfen bei der
+// Namespace-Enumeration nie als deviceId fehlinterpretiert werden.
+bool isLegacyKeyName_(const char* k) {
+    return strcmp(k, "presets")   == 0 || strcmp(k, "presets~")  == 0 ||
+           strcmp(k, "presets#0") == 0 || strcmp(k, "presets#1") == 0;
+}
+
+// "<id>", "<id>~", "<id>#0", "<id>#1" -> "<id>" (A/B-Suffixe des nvs_helper).
+String baseIdFromKey_(const char* k) {
+    String s(k);
+    if (s.endsWith("~")) return s.substring(0, s.length() - 1);
+    if (s.length() >= 2 && s.charAt(s.length() - 2) == '#') {
+        const char c = s.charAt(s.length() - 1);
+        if (c == '0' || c == '1') return s.substring(0, s.length() - 2);
+    }
+    return s;
+}
+
+// Alle Per-Speaker-Basis-Ids im Namespace (Blob-Slices UND Gen-Keys, damit
+// ein Slice, der nur im Spare-Slot "<id>~" liegt, gefunden wird). Dedupe
+// linear — Flotten sind <= ~20 Geraete.
+void listPerSpeakerIds_(std::vector<String>& out) {
+    nvs_iterator_t it = nullptr;
+    esp_err_t err = nvs_entry_find("nvs", NVS_NS, NVS_TYPE_ANY, &it);
+    while (err == ESP_OK && it != nullptr) {
+        nvs_entry_info_t info{};
+        nvs_entry_info(it, &info);
+        if (!isLegacyKeyName_(info.key)) {
+            String base = baseIdFromKey_(info.key);
+            bool seen = false;
+            for (auto& b : out) { if (b == base) { seen = true; break; } }
+            if (!seen && base.length()) out.push_back(base);
+        }
+        err = nvs_entry_next(&it);
+    }
+    if (it) nvs_release_iterator(it);
+}
+
+// Loescht einen Basis-Key samt A/B-Geschwistern. isKey-Guard, damit kein
+// nvs_erase_key-NOT_FOUND-E-Log entsteht (die Zeilen haben in freds Serial-
+// Mitschnitt msg1367457 fuer Verwirrung gesorgt; sie sind harmlos, aber
+// vermeidbar). Reines Erase = die einzige Operation, die an der vollen
+// Partition Platz SCHAFFT, ohne vorher schreiben zu muessen.
+void eraseStoreKeys_(const char* baseKey) {
+    Preferences p;
+    if (!p.begin(NVS_NS, false)) return;
+    const String k1 = String(baseKey) + "~";
+    const String g0 = String(baseKey) + "#0";
+    const String g1 = String(baseKey) + "#1";
+    if (p.isKey(baseKey))    p.remove(baseKey);
+    if (p.isKey(k1.c_str())) p.remove(k1.c_str());
+    if (p.isKey(g0.c_str())) p.remove(g0.c_str());
+    if (p.isKey(g1.c_str())) p.remove(g1.c_str());
+    p.end();
+}
 
 // Escaped fuer XML-Text-Inhalt UND fuer doppelt-gequotete Attribute-Werte.
 // Beide Kontexte brauchen mind. & und < entkommen; im Attribut zusaetzlich ".
@@ -72,84 +137,223 @@ PresetSource presetSourceFromStr(const String& s) {
     return PresetSource::EMPTY;
 }
 
-void PresetStore::loadFromNVS() {
-    LockGuard g(*this);
-    JsonDocument doc;
-    bool dataPresent = false;
-    if (!nvsLoadJson(NVS_NS, NVS_KEY, doc, &dataPresent)) {
-        // FHEM 144729 #153: "fresh" (kein Blob) von "Blob vorhanden aber
-        // UNLESBAR" unterscheiden. Letzteres war bis 2026-07-17 komplett
-        // still — der Store startete kommentarlos leer, und der naechste
-        // /full-Poll konnte die Speaker-Caches wipen. Jetzt: Flag setzen
-        // (handleAccountFull gated damit auf 404, /api/status zeigt
-        // preset_store.load_ok=false) + laut loggen. Das Flag loescht der
-        // erste erfolgreiche saveToNVS (der ersetzt den defekten Blob).
-        loadFailed_ = dataPresent;
-        if (dataPresent)
-            Serial.println("[preset] LOAD FAILED — stored blob unreadable; "
-                           "store startet leer, /full liefert 404 bis zum "
-                           "ersten erfolgreichen Save (load_ok=false)");
-        else
-            Serial.println("[preset] no stored presets (fresh)");
-        return;
+// Ein Speaker-Slice ({deviceId, presets:[...]}) aus NVS-JSON. Gleiche Form
+// als Array-Element im Legacy-Gesamtblob und als Root-Objekt eines
+// Per-Speaker-Keys — deviceId steht redundant im Slice (self-describing,
+// ~25 B), damit Export/Debug ohne Key-Kontext lesbar bleiben.
+void PresetStore::parseSlice_(JsonObject ps, PerSpeaker& s) {
+    s.deviceId = (const char*)(ps["deviceId"] | "");
+    // Alle 6 Slots erst sauber initialisieren, sonst hängen
+    // uninitialisierte uint8_t-Werte in slot/source.
+    for (int i = 0; i < 6; ++i) {
+        s.slots[i].slot   = i + 1;
+        s.slots[i].source = PresetSource::EMPTY;
     }
-    loadFailed_ = false;
-    speakers_.clear();
-    for (JsonObject ps : doc["speakers"].as<JsonArray>()) {
-        PerSpeaker s;
-        s.deviceId = (const char*)ps["deviceId"];
-        // Alle 6 Slots erst sauber initialisieren, sonst hängen
-        // uninitialisierte uint8_t-Werte in slot/source.
-        for (int i = 0; i < 6; ++i) {
-            s.slots[i].slot   = i + 1;
-            s.slots[i].source = PresetSource::EMPTY;
+    for (JsonObject pj : ps["presets"].as<JsonArray>()) {
+        uint8_t slot = pj["slot"].as<uint8_t>();
+        if (slot < 1 || slot > 6) continue;
+        Preset& p     = s.slots[slot - 1];
+        p.slot        = slot;
+        p.source      = presetSourceFromStr(String((const char*)pj["source"]));
+        p.name        = (const char*)(pj["name"]      | "");
+        p.stationId   = (const char*)(pj["stationId"] | "");
+        p.streamUrl   = (const char*)(pj["streamUrl"] | "");
+        // Gegenstueck zur Sparmassnahme in buildSliceDoc_(): ein FEHLENDES
+        // imageUrl-Feld heisst bei TUNEIN "war die kanonische Logo-URL"
+        // -> rekonstruieren. Ein VORHANDENES Feld (auch ein leeres) wird
+        // unveraendert uebernommen, damit "bewusst kein Cover" und alle
+        // Daten aus Firmwares VOR diesem Fix unveraendert bleiben.
+        if (pj["imageUrl"].isNull() && p.source == PresetSource::TUNEIN) {
+            p.imageUrl = tuneInLogoUrl(p.stationId);
+        } else {
+            p.imageUrl = (const char*)(pj["imageUrl"] | "");
         }
-        for (JsonObject pj : ps["presets"].as<JsonArray>()) {
-            uint8_t slot = pj["slot"].as<uint8_t>();
-            if (slot < 1 || slot > 6) continue;
-            Preset& p     = s.slots[slot - 1];
-            p.slot        = slot;
-            p.source      = presetSourceFromStr(String((const char*)pj["source"]));
-            p.name        = (const char*)(pj["name"]      | "");
-            p.stationId   = (const char*)(pj["stationId"] | "");
-            p.streamUrl   = (const char*)(pj["streamUrl"] | "");
-            // Gegenstueck zur Sparmassnahme in saveToNVS(): ein FEHLENDES
-            // imageUrl-Feld heisst bei TUNEIN "war die kanonische Logo-URL"
-            // -> rekonstruieren. Ein VORHANDENES Feld (auch ein leeres) wird
-            // unveraendert uebernommen, damit "bewusst kein Cover" und alle
-            // Daten aus Firmwares VOR diesem Fix unveraendert bleiben.
-            if (pj["imageUrl"].isNull() && p.source == PresetSource::TUNEIN) {
-                p.imageUrl = tuneInLogoUrl(p.stationId);
-            } else {
-                p.imageUrl = (const char*)(pj["imageUrl"] | "");
-            }
-            p.rawContentItem   = (const char*)(pj["rawContentItem"]   | "");
-            p.opaqueSourceName = (const char*)(pj["opaqueSourceName"] | "");
-        }
-        speakers_.push_back(s);
+        p.rawContentItem   = (const char*)(pj["rawContentItem"]   | "");
+        p.opaqueSourceName = (const char*)(pj["opaqueSourceName"] | "");
     }
-    Serial.printf("[preset] loaded presets for %u speakers\n",
-                  (unsigned)speakers_.size());
 }
 
-bool PresetStore::saveToNVS() {
+void PresetStore::loadFromNVS() {
     LockGuard g(*this);
-    JsonDocument doc;
-    JsonArray arr = doc["speakers"].to<JsonArray>();
+    speakers_.clear();
+    loadFailedIds_.clear();
+    legacyLoadFailed_ = false;
+
+    // 1) Legacy-Gesamtblob (<= v0.8.39), falls noch vorhanden, als Basis
+    //    einlesen. Per-Speaker-Slices (Schritt 2) ueberschreiben ihn je
+    //    Device — nach einer unterbrochenen Migration existieren beide, und
+    //    die Slices sind dann der juengere Stand.
+    bool legacyReadable = false;
+    bool legacyPresent  = false;
+    {
+        JsonDocument doc;
+        if (nvsLoadJson(NVS_NS, LEGACY_KEY, doc, &legacyPresent)) {
+            legacyReadable = true;
+            for (JsonObject ps : doc["speakers"].as<JsonArray>()) {
+                PerSpeaker s;
+                parseSlice_(ps, s);
+                if (s.deviceId.length()) speakers_.push_back(s);
+            }
+        } else if (legacyPresent) {
+            // FHEM 144729 #153: Blob liegt da, ist aber unlesbar. NICHT
+            // loeschen (letzte Kopie/Forensik) und NICHT migrieren — /full
+            // bleibt via load_ok=false gated (404, Speaker behalten ihre
+            // Caches). Anders als beim Gesamtblob-Format heilt ein
+            // spaeterer Save diesen Zustand nicht mehr (er ersetzt den
+            // defekten Blob nicht laenger) — das Gate steht bewusst bis
+            // zum naechsten Boot; nvs_flash_init raeumt echte
+            // Inkonsistenzen dort ohnehin weg.
+            legacyLoadFailed_ = true;
+            Serial.println("[preset] LOAD FAILED — legacy blob unreadable; "
+                           "/full liefert 404 (load_ok=false), Blob bleibt "
+                           "fuer Forensik liegen");
+        }
+    }
+
+    // 2) Per-Speaker-Slices (v0.8.40+).
+    std::vector<String> sliceIds;
+    listPerSpeakerIds_(sliceIds);
+    std::vector<String> loadedSliceIds;
+    for (auto& id : sliceIds) {
+        JsonDocument doc;
+        bool present = false;
+        if (nvsLoadJson(NVS_NS, id.c_str(), doc, &present)) {
+            PerSpeaker s;
+            JsonObject ps = doc.as<JsonObject>();
+            parseSlice_(ps, s);
+            if (!s.deviceId.length()) s.deviceId = id;   // defensiv: Key gilt
+            auto* existing = find_(s.deviceId);
+            if (existing) *existing = s; else speakers_.push_back(s);
+            loadedSliceIds.push_back(id);
+        } else if (present) {
+            // Slice vorhanden aber unlesbar (beide A/B-Slots defekt — nach
+            // Readback-Verify + Slot-Fallback ein Randfall). Gate wie beim
+            // Legacy-Fall; heilt, sobald genau DIESER Slice wieder
+            // erfolgreich geschrieben wird (healLoadFail_).
+            loadFailedIds_.push_back(id);
+            Serial.printf("[preset] LOAD FAILED slice %s — unlesbar, /full "
+                          "gated (load_ok=false)\n", id.c_str());
+        }
+    }
+    loadFailed_ = legacyLoadFailed_ || !loadFailedIds_.empty();
+
+    if (!legacyPresent && sliceIds.empty()) {
+        Serial.println("[preset] no stored presets (fresh)");
+        return;
+    }
+    Serial.printf("[preset] loaded presets for %u speakers (%u per-speaker "
+                  "slice(s)%s)\n",
+                  (unsigned)speakers_.size(), (unsigned)loadedSliceIds.size(),
+                  legacyReadable ? ", legacy blob pending migration" : "");
+
+    // 3) Einmal-Migration Gesamtblob -> Per-Speaker-Keys; nur wenn der
+    //    Legacy-Blob LESBAR war (sonst gibt es nichts zu retten).
+    if (legacyReadable) migrateLegacyBlob_(loadedSliceIds);
+}
+
+// Heilt das Load-Fail-Gate fuer einen Slice, der soeben erfolgreich
+// geschrieben (oder als leer geloescht) wurde — der defekte Blob unter
+// diesem Key ist damit ersetzt bzw. weg.
+void PresetStore::healLoadFail_(const String& deviceId) {
+    for (size_t i = 0; i < loadFailedIds_.size(); ++i) {
+        if (loadFailedIds_[i] == deviceId) {
+            loadFailedIds_.erase(loadFailedIds_.begin() + i);
+            break;
+        }
+    }
+    loadFailed_ = legacyLoadFailed_ || !loadFailedIds_.empty();
+}
+
+// Einmal-Migration: jeden Speaker aus dem Legacy-Gesamtblob als eigenen
+// Key persistieren, danach den Gesamtblob loeschen.
+//
+// Phase A schreibt die Slices NEBEN den Legacy-Blob (verlustfrei, braucht
+// aber Platz fuer beides). Scheitert das an der Platz-Kante — exakt der
+// Zustand, in dem das Geraet ohnehin nichts mehr persistieren kann
+// (FHEM 144729, NOT_ENOUGH_SPACE bei 9 Boxen) — folgt Phase B: Legacy-Blob
+// ZUERST loeschen (reines Erase schafft Platz ohne Write; der volle Stand
+// liegt im RAM), dann die restlichen Slices schreiben. Restrisiko Phase B:
+// Stromverlust im <1-s-Fenster zwischen Erase und letztem Slice-Write
+// verliert die noch ungeschriebenen Slices — abgewogen gegen "Store
+// dauerhaft schreibgesperrt" der bessere Deal, und nur auf Geraeten, die
+// Phase A nicht schaffen.
+void PresetStore::migrateLegacyBlob_(const std::vector<String>& haveSlice) {
+    std::vector<String> pending;
     for (auto& s : speakers_) {
-        // Komplett leere Eintraege nicht persistieren: semantisch identisch
-        // zu "absent" (buildDevicePresets_ liefert so oder so kein <presets>),
-        // aber sie akkumulieren sonst als Dauer-Cruft im Blob (jeder je
-        // gesehene/geloeschte Speaker bliebe fuer immer drin). Spotify-
-        // Bindings liegen separat in sixback-spot und sind nicht betroffen.
+        bool have = false;
+        for (auto& id : haveSlice) { if (id == s.deviceId) { have = true; break; } }
+        if (have) continue;
         bool any = false;
         for (int i = 0; i < 6; ++i) {
             if (s.slots[i].source != PresetSource::EMPTY) { any = true; break; }
         }
-        if (!any) continue;
-        JsonObject ps = arr.add<JsonObject>();
-        ps["deviceId"] = s.deviceId;
-        JsonArray pa  = ps["presets"].to<JsonArray>();
+        if (!any) continue;   // Leer-Slices nie materialisieren (Anti-Cruft)
+        if (s.deviceId.length() == 0 || s.deviceId.length() > 15) {
+            // Kann nie NVS-Key werden (echte deviceIds sind 12-hex-MACs).
+            // Sicherheit geht vor: Legacy-Blob NICHT anfassen, Migration
+            // beim naechsten Boot erneut versuchen.
+            Serial.printf("[preset] migrate ABORT: deviceId '%s' ist kein "
+                          "gueltiger NVS-Key — legacy blob bleibt\n",
+                          s.deviceId.c_str());
+            return;
+        }
+        pending.push_back(s.deviceId);
+    }
+    if (pending.empty()) {
+        // Alle Speaker haben schon Slices (Migration war fast durch) —
+        // nur noch den Gesamtblob wegraeumen.
+        eraseStoreKeys_(LEGACY_KEY);
+        Serial.println("[preset] migration: alle Slices vorhanden, legacy "
+                       "blob entfernt");
+        return;
+    }
+    // Fail-Zaehler sichern: ein erwarteter Phase-A-Fail an der Kante, den
+    // Phase B heilt, soll im /api/status nicht als Feld-Problem auftauchen
+    // (fred wuerde ihn melden). Bleibt die Migration unvollstaendig, bleiben
+    // die Zaehler stehen — dann sind es echte Fails.
+    const uint32_t preFails    = saveFails_;
+    const uint32_t preNvsFails = saveNvsFails_;
+    std::vector<String> failed;
+    for (auto& id : pending) {
+        if (!saveSpeakerToNVS_(id)) failed.push_back(id);
+    }
+    if (failed.empty()) {
+        eraseStoreKeys_(LEGACY_KEY);
+        saveFails_ = preFails; saveNvsFails_ = preNvsFails;
+        Serial.printf("[preset] migrated %u speaker(s) to per-speaker keys, "
+                      "legacy blob removed\n", (unsigned)pending.size());
+        return;
+    }
+    Serial.printf("[preset] migrate phase A: %u/%u slice(s) passten nicht "
+                  "NEBEN den legacy blob — Druck-Migration (Blob zuerst "
+                  "loeschen, Stand liegt vollstaendig im RAM)\n",
+                  (unsigned)failed.size(), (unsigned)pending.size());
+    eraseStoreKeys_(LEGACY_KEY);
+    size_t still = 0;
+    for (auto& id : failed) {
+        if (!saveSpeakerToNVS_(id)) {
+            ++still;
+            Serial.printf("[preset] migrate FAIL %s — Slice bleibt RAM-only "
+                          "bis Platz frei wird\n", id.c_str());
+        }
+    }
+    if (still == 0) {
+        saveFails_ = preFails; saveNvsFails_ = preNvsFails;
+        Serial.printf("[preset] migrated %u speaker(s) via Druck-Migration, "
+                      "legacy blob removed\n", (unsigned)pending.size());
+    } else {
+        Serial.printf("[preset] migration UNVOLLSTAENDIG: %u Slice(s) "
+                      "RAM-only (NVS weiterhin zu voll)\n", (unsigned)still);
+    }
+}
+
+// Serialisiert EINEN Speaker als Slice-Dokument {deviceId, presets:[...]}.
+// Enthaelt die komplette NVS-Sparlogik (TUNEIN-Slimming) — Export/Backup
+// (exportJson) bleibt davon unberuehrt und absichtlich vollstaendig.
+void PresetStore::buildSliceDoc_(const PerSpeaker& s, JsonDocument& doc) {
+    doc["deviceId"] = s.deviceId;
+    JsonArray pa = doc["presets"].to<JsonArray>();
+    {
         for (int i = 0; i < 6; ++i) {
             const Preset& p = s.slots[i];
             if (p.source == PresetSource::EMPTY) continue;
@@ -203,33 +407,88 @@ bool PresetStore::saveToNVS() {
             }
         }
     }
+}
+
+// Persistiert EINEN Speaker (Caller haelt den Lock). Leerer/fehlender Slice
+// -> Key wird GELOESCHT statt ein Leer-Blob geschrieben: gleiche Semantik
+// wie die alte Anti-Cruft-Regel im Gesamtblob ("absent"), gibt aber Entries
+// FREI — an der vollen Partition die einzige Operation, die das kann
+// (144729-Catch-22: jede andere Verkleinerung war selbst ein Write).
+bool PresetStore::saveSpeakerToNVS_(const String& deviceId) {
+    if (deviceId.length() == 0 || deviceId.length() > 15) {
+        // NVS-Keys enden bei 15 Zeichen; echte deviceIds (12-hex-MAC) passen
+        // immer. Alles andere ist ein Programmierfehler -> laut + zaehlen.
+        ++saveFails_;
+        ++saveNvsFails_;
+        Serial.printf("[preset] saveSpeaker REJECT: deviceId '%s' ist kein "
+                      "gueltiger NVS-Key\n", deviceId.c_str());
+        return false;
+    }
+    auto* s = find_(deviceId);
+    bool any = false;
+    if (s) {
+        for (int i = 0; i < 6; ++i) {
+            if (s->slots[i].source != PresetSource::EMPTY) { any = true; break; }
+        }
+    }
+    if (!any) {
+        eraseStoreKeys_(deviceId.c_str());
+        ++saveOkCount_;             // Zustand hat sich real geaendert/gebessert
+        healLoadFail_(deviceId);
+        return true;
+    }
+    JsonDocument doc;
+    buildSliceDoc_(*s, doc);
     // FHEM 144729 #153: ein bei Heap-Knappheit ueberlaufenes JsonDocument
-    // (ArduinoJson dropt Nodes still) wuerde als VALIDES Teil-JSON committed
-    // und verloere die hinteren Speaker-Slices dauerhaft. Dann lieber gar
-    // nicht schreiben — der alte NVS-Stand bleibt intakt, RAM ist weiterhin
-    // vollstaendig, der naechste Save (mit mehr Heap) heilt.
+    // (ArduinoJson dropt Nodes still) wuerde als VALIDES Teil-JSON committed.
+    // Bei einem Einzel-Slice (~1 KB) praktisch unerreichbar, aber der Check
+    // kostet nichts — lieber gar nicht schreiben, der naechste Save heilt.
     if (doc.overflowed()) {
         ++saveFails_;
         ++saveHeapAborts_;          // transient: NVS intakt, naechster Save heilt
-        Serial.println("[preset] saveToNVS ABORT: JsonDocument overflowed "
+        Serial.println("[preset] saveSpeaker ABORT: JsonDocument overflowed "
                        "(heap zu knapp) — NVS-Stand bleibt unangetastet");
         return false;
     }
-    bool ok = nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
+    bool ok = nvsSaveJsonWithCleanup(NVS_NS, deviceId.c_str(), doc);
     if (ok) {
-        // Erfolgreicher Save ersetzt einen ggf. defekten Boot-Blob ->
-        // Load-Fail-Zustand ist damit geheilt, /full darf wieder servieren.
-        loadFailed_ = false;
+        // Erfolgreicher Slice-Save ersetzt einen ggf. defekten Blob unter
+        // GENAU diesem Key -> dessen Load-Fail-Gate ist geheilt.
+        healLoadFail_(deviceId);
         ++saveOkCount_;             // Generation fuer den Auto-Import-Backoff
     } else {
         // Zentrale Zaehlung fuer ALLE Caller — clear()/syncToGroup()
         // ignorierten das Ergebnis bis 2026-07-17 komplett (silent loss).
         ++saveFails_;
         ++saveNvsFails_;            // echter Schreibfehler = Kapazitaetskante
-        Serial.printf("[preset] saveToNVS FAILED (nvs write, #%u)\n",
-                      (unsigned)saveNvsFails_);
+        Serial.printf("[preset] saveSpeaker FAILED (nvs write, #%u) dev=%s\n",
+                      (unsigned)saveNvsFails_, deviceId.c_str());
     }
     return ok;
+}
+
+bool PresetStore::saveToNVS() {
+    LockGuard g(*this);
+    // Vollsweep (Import/Restore): jeden Slice einzeln schreiben, danach
+    // Keys verwaister Devices wegputzen — ein Restore ERSETZT den Bestand,
+    // sonst wuerden alte Slices beim naechsten Boot wiederauferstehen.
+    bool all = true;
+    for (auto& s : speakers_) {
+        all = saveSpeakerToNVS_(s.deviceId) && all;
+    }
+    std::vector<String> ids;
+    listPerSpeakerIds_(ids);
+    for (auto& id : ids) {
+        if (!find_(id)) eraseStoreKeys_(id.c_str());
+    }
+    // Liegt (nach unvollstaendiger Migration) noch ein Legacy-Blob herum,
+    // ist er nach einem VOLLSTAENDIG persistierten Restore obsolet.
+    if (all) {
+        eraseStoreKeys_(LEGACY_KEY);
+        legacyLoadFailed_ = false;
+        loadFailed_ = !loadFailedIds_.empty();
+    }
+    return all;
 }
 
 size_t PresetStore::speakerCount() {
@@ -289,7 +548,7 @@ bool PresetStore::set(const String& deviceId, const Preset& p) {
     if (p.slot < 1 || p.slot > 6) return false;
     auto* s = findOrCreate_(deviceId);
     s->slots[p.slot - 1] = p;
-    return saveToNVS();
+    return saveSpeakerToNVS_(deviceId);
 }
 
 bool PresetStore::setSlots(const String& deviceId, const std::vector<Preset>& presets) {
@@ -303,7 +562,7 @@ bool PresetStore::setSlots(const String& deviceId, const std::vector<Preset>& pr
         s->slots[p.slot - 1].slot = p.slot;  // defensiv re-stamp slot
         changed = true;
     }
-    if (changed) return saveToNVS();
+    if (changed) return saveSpeakerToNVS_(deviceId);
     return false;
 }
 
@@ -317,7 +576,10 @@ bool PresetStore::clear(const String& deviceId, uint8_t slot) {
     p.source = PresetSource::EMPTY;
     p.name = ""; p.stationId = ""; p.streamUrl = ""; p.imageUrl = "";
     p.rawContentItem = ""; p.opaqueSourceName = "";
-    saveToNVS();
+    // Wird der Slice dadurch komplett leer, LOESCHT saveSpeakerToNVS_ den
+    // Key — d.h. Preset-Loeschen kann jetzt auch an der vollen Partition
+    // Platz freigeben statt am eigenen Write zu scheitern.
+    saveSpeakerToNVS_(deviceId);
     return true;
 }
 
@@ -334,9 +596,12 @@ int PresetStore::syncToGroup(const String& sourceDeviceId,
             tgt->slots[i] = src->slots[i];
             tgt->slots[i].slot = i + 1;
         }
+        // Pro Ziel ein kleiner Slice-Write (statt frueher 1 Gesamt-Write):
+        // ein volles Ziel blockiert die anderen nicht mehr; Fehlschlaege
+        // zaehlt saveSpeakerToNVS_ zentral.
+        saveSpeakerToNVS_(tgtId);
         ++n;
     }
-    if (n > 0) saveToNVS();
     return n;
 }
 

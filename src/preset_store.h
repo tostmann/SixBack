@@ -68,7 +68,11 @@ public:
     };
 
     void loadFromNVS();
-    bool saveToNVS();  // true = NVS-Commit erfolgreich; false = Partition voll/fragmentiert
+    // Vollsweep: schreibt JEDEN Slice einzeln (leere werden geloescht) und
+    // raeumt Keys verwaister Devices weg. Nur noch fuer Import/Restore —
+    // Einzel-Aenderungen laufen intern ueber saveSpeakerToNVS_ (1 Slice).
+    // true = alle Slices committed; false = mindestens einer scheiterte.
+    bool saveToNVS();
 
     // Lese alle 6 Slots fuer einen Speaker; leere Slots haben source=EMPTY.
     std::vector<Preset> getForSpeaker(const String& deviceId);
@@ -162,8 +166,24 @@ private:
     PerSpeaker* find_(const String& deviceId);
     void initMutex_();
 
+    // --- Per-Speaker-Persistenz (v0.8.40, FHEM 144729 NVS-Kante) -----------
+    // Jeder Speaker liegt als EIGENER NVS-Key (Key = deviceId, 12-hex-MAC;
+    // A/B-Geschwister "<id>~"/"<id>#0"/"<id>#1" macht nvs_helper). Ein Save
+    // schreibt nur noch den betroffenen Slice (~0,5-1 KB) statt des
+    // Gesamtbestands — der EINE grosse Write war die Kapazitaetskante, an
+    // der ein 9-Boxen-Store jede Aenderung blockierte (msg1367457:
+    // NOT_ENOUGH_SPACE bei blob=4846). Der Legacy-Gesamtblob ("presets")
+    // wird beim ersten Boot migriert und dann geloescht.
+    void parseSlice_(JsonObject ps, PerSpeaker& s);            // NVS-JSON -> Slice
+    void buildSliceDoc_(const PerSpeaker& s, JsonDocument& out); // Slice -> NVS-JSON
+    bool saveSpeakerToNVS_(const String& deviceId);   // Caller haelt den Lock
+    void migrateLegacyBlob_(const std::vector<String>& haveSlice);
+    void healLoadFail_(const String& deviceId);       // Slice-Save heilt Load-Fail
+
     mutable SemaphoreHandle_t mx_ = nullptr;
-    bool     loadFailed_ = false;   // Blob vorhanden aber unlesbar (Boot)
+    bool     loadFailed_ = false;   // abgeleitet: legacyLoadFailed_ || Slices
+    bool     legacyLoadFailed_ = false;   // Legacy-Gesamtblob vorhanden, unlesbar
+    std::vector<String> loadFailedIds_;   // Per-Speaker-Slices vorhanden, unlesbar
     uint32_t saveFails_  = 0;       // saveToNVS-Fehlschlaege seit Boot (Summe)
     uint32_t saveHeapAborts_ = 0;   // davon: JsonDocument-Overflow (transient)
     uint32_t saveNvsFails_   = 0;   // davon: echter NVS-Schreibfehler

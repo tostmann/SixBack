@@ -31,11 +31,15 @@ struct StreamItem {
 void init();
 
 // Upsert by streamUrl. Persists to NVS. Returns true if a new entry was
-// created, false if an existing one was updated.
-bool addStreamItem(const StreamItem& item);
+// created, false if an existing one was updated. If `persisted` is non-null it
+// receives the NVS-save result — false means the change lives in RAM only and
+// will not survive a reboot (typically: partition out of space).
+bool addStreamItem(const StreamItem& item, bool* persisted = nullptr);
 
-// Remove by streamUrl. Returns true if something was removed.
-bool removeStreamItem(const String& streamUrl);
+// Remove by streamUrl. Returns true if something was removed. `persisted` as
+// in addStreamItem — false after a removal means the stream will REAPPEAR on
+// the next reboot (the on-flash state still has it).
+bool removeStreamItem(const String& streamUrl, bool* persisted = nullptr);
 
 // All stored streams (for the sidebar tile-grid + export).
 std::vector<StreamItem> listStreams();

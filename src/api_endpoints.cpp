@@ -3473,8 +3473,9 @@ void handleSelfReboot(AsyncWebServerRequest* req) {
 //   Beide multipart/octet-stream firmware upload, Reboot nach Finalize.
 //   Unterschied: Update.begin(..., U_FLASH) vs U_SPIFFS — bei arduino-esp32
 //   ist U_SPIFFS auch der Pfad fuer LittleFS (gleiche Partition).
-// Nur auf Builds mit SIXBACK_OTA_ENABLED (ESP32-classic + S3) — auf C3/C6
-// hat die partition keinen A/B-Slot, Update.h kann nicht schreiben.
+// Gated auf SIXBACK_OTA_ENABLED — seit dem 4MB-Layout-Umbau haben ALLE
+// Targets app0+app1 (auch C3/C6) und das Flag ist in jedem env gesetzt; das
+// Gate bleibt als Schalter fuer etwaige kuenftige Single-App-Sonderbuilds.
 // -----------------------------------------------------------------------------
 #ifdef SIXBACK_OTA_ENABLED
 void handleOtaFinalize(AsyncWebServerRequest* req) {
@@ -4494,7 +4495,18 @@ void handleStreamsAdd(AsyncWebServerRequest* req, JsonDocument& body) {
         return;
     }
     if (it.name.length() == 0) it.name = it.streamUrl;
-    bool created = sixback::streams::addStreamItem(it);
+    // Honest persistence (144729 #201): a stream delete "succeeded" but never
+    // reached NVS at the full partition. Same pattern as the preset PUT above —
+    // UI sees 500 + error detail instead of a fake "ok":true.
+    bool persisted = false;
+    bool created = sixback::streams::addStreamItem(it, &persisted);
+    if (!persisted) {
+        req->send(500, "application/json",
+                  "{\"ok\":false,\"error\":\"NVS save failed (partition out of space) — "
+                  "the stream is in RAM only and will be lost on reboot; "
+                  "remove unused speakers or try POST /api/nvs/cleanup\"}");
+        return;
+    }
     JsonDocument out;
     out["ok"]      = true;
     out["created"] = created;
@@ -4509,7 +4521,19 @@ void handleStreamsDelete(AsyncWebServerRequest* req) {
         req->send(400, "application/json", "{\"error\":\"url query-param required\"}");
         return;
     }
-    bool removed = sixback::streams::removeStreamItem(req->getParam("url")->value());
+    bool persisted = true;
+    bool removed = sixback::streams::removeStreamItem(req->getParam("url")->value(),
+                                                      &persisted);
+    if (removed && !persisted) {
+        // The tile is gone from RAM but the on-flash blob still has it — say
+        // so, instead of letting the user discover it on the next reboot
+        // (exactly the 144729 #201/#205 phenotype).
+        req->send(500, "application/json",
+                  "{\"ok\":false,\"error\":\"NVS save failed (partition out of space) — "
+                  "the stream is removed for now but will REAPPEAR after a reboot; "
+                  "remove unused speakers or try POST /api/nvs/cleanup\"}");
+        return;
+    }
     JsonDocument out;
     out["ok"]      = true;
     out["removed"] = removed;
@@ -4521,6 +4545,10 @@ void handleStreamsDelete(AsyncWebServerRequest* req) {
 // Bulk merge — upserts each item by stream_url. Returns {ok:true, imported:N}.
 void handleStreamsImport(AsyncWebServerRequest* req, JsonDocument& body) {
     int imported = 0;
+    // Every addStreamItem() writes the WHOLE library blob, so the persist
+    // status of the LAST item decides what is actually on flash — earlier
+    // per-item failures are irrelevant if the final write went through.
+    bool persisted = true;  // empty import -> nothing to save
     for (JsonObject o : body["items"].as<JsonArray>()) {
         sixback::streams::StreamItem it;
         it.name        = (const char*)(o["name"]         | "");
@@ -4531,8 +4559,15 @@ void handleStreamsImport(AsyncWebServerRequest* req, JsonDocument& body) {
         it.bitrate     = (const char*)(o["bitrate"]      | "");
         if (it.streamUrl.length() == 0) continue;
         if (it.name.length() == 0) it.name = it.streamUrl;
-        sixback::streams::addStreamItem(it);
+        sixback::streams::addStreamItem(it, &persisted);
         imported++;
+    }
+    if (!persisted) {
+        req->send(500, "application/json",
+                  "{\"ok\":false,\"error\":\"NVS save failed (partition out of space) — "
+                  "the imported streams are in RAM only and will be lost on reboot; "
+                  "remove unused speakers or try POST /api/nvs/cleanup\"}");
+        return;
     }
     JsonDocument out;
     out["ok"]       = true;

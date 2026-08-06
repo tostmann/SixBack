@@ -166,6 +166,10 @@
      alarming: nothing is broken, the probe just has not come back yet. */
   .preset .slot-hw-unknown-badge { color: var(--mute); font-weight: 600;
                                    font-size: .85em; font-style: italic; }
+  /* hardware state stale (speaker stopped answering, showing last reading) —
+     same muted styling: informational, the retry loop is already on it. */
+  .preset .slot-hw-stale-badge { color: var(--mute); font-weight: 600;
+                                 font-size: .85em; font-style: italic; }
   .preset .slot-spot-badge { cursor: pointer; font-size: 1em; padding: 0 .25em;
                              border-radius: 3px; user-select: none;
                              transition: opacity .15s, background .15s; }
@@ -733,8 +737,10 @@
   </details>
 </div>
 
-</div><!-- /#sys-collapsible -->
-
+<!-- Rarely-changed settings — inside the collapsible SYSTEM section so the
+     page above stays focused on the speakers (forum request, 2026-08-06).
+     Auto-Migrate at Boot deliberately stays at the top of the page: it must
+     be reachable in the short window before migration starts scanning. -->
 <div class="automode-bar" id="diagshare-bar" style="margin-top:1em">
   <span class="label">Share diagnostic snapshots:</span>
   <label class="switch" title="Off by default — uploads pre-migration snapshots to sixback.io for the maintainer">
@@ -797,6 +803,8 @@
     Leave empty + Save to reset. Takes effect after a reboot.
   </span>
 </div>
+
+</div><!-- /#sys-collapsible -->
 
 <!-- Modals -->
 <div class="modal" id="modal-add">
@@ -2288,6 +2296,12 @@ function presetCard(devId, slotNum) {
   // reading for this slot: its hardware state is UNKNOWN, not empty. Claiming
   // "(empty)" here is what produced the phantom push buttons (FHEM 144729 #196).
   const hwUnknown  = (d.hwReachable === false) && hwEmpty;
+  // Probe failed but we still show an earlier reading for this slot: the
+  // "on speaker" side is the LAST KNOWN state, not the current one. Say so
+  // (badge below) instead of rendering yesterday's state as fresh — pushing
+  // against it is a guess, and a card mixing "not reachable" (empty slots)
+  // with unmarked stale content looked inconsistent (.39 review L1/L2).
+  const hwStale    = (d.hwReachable === false) && !hwEmpty;
   const synced     = hwUnknown ? false : slotsMatch_(store, hw);
   const opaque     = (store.source === 'OPAQUE');
 
@@ -2313,6 +2327,7 @@ function presetCard(devId, slotNum) {
   else if (storeEmpty && hwEmpty)  badge = '';
   else if (synced)            badge = '<span class="slot-synced-badge">✓ synced</span>';
   else                        badge = '<span class="slot-edit-badge">✏ unsaved</span>';
+  if (hwStale) badge += ' <span class="slot-hw-stale-badge" title="The speaker stopped answering — the on-speaker side shows its last known state and may be outdated. Retrying automatically.">(stale)</span>';
   // Spotify-Badge in der Slot-Card wurde entfernt — Library-Edit passiert
   // jetzt in der linken Sidebar (Spotify-Tab, ✏-Button pro Library-Tile).
   // Slots werden ausschliesslich per D&D vom Library-Tile gebunden; bestehende
@@ -4555,7 +4570,7 @@ async function actSpeaker(devId, action) {
         const hwSlots = normalizeHwSlots_(hwR.slots || [], hwR.ok);
         const d = STATE.presetsByDev[devId] = STATE.presetsByDev[devId] || {store: normalizeStoreSlots_([]), hw: hwSlots};
         d.hw = hwSlots;
-        d.hwReachable = hwR.ok !== false;
+        d.hwReachable = hwR.ok === true;   // align with loadPresetsFor: only an explicit ok:true counts as reachable (.39 review L3)
         hwOk = !!hwR.ok;
         const populated = hwSlots.filter(s => !isSlotEmpty_(s)).length;
         progressStep('hwget', hwOk ? 'done' : 'error',
@@ -5206,7 +5221,7 @@ async function refreshStatuses() {
       const d = STATE.presetsByDev[sid] = STATE.presetsByDev[sid] ||
                 { store: normalizeStoreSlots_([]), hw: hwSlots };
       d.hw = hwSlots;
-      d.hwReachable = hwR.ok !== false;
+      d.hwReachable = hwR.ok === true;   // align with loadPresetsFor: only an explicit ok:true counts as reachable (.39 review L3)
       hwOk = !!hwR.ok;
       renderSpeakerSlots(sid);
       applyPlayingHighlight(sid);

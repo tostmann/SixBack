@@ -7,9 +7,9 @@
 #define FW_NAME           "SixBack"
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  8
-#define FW_VERSION_BUILD  1912
+#define FW_VERSION_BUILD  1923
 
-#define FW_VERSION_STRING "0.8.39+1912"
-#define FW_BUILD_DATE     "2026-08-03 23:23:06"
+#define FW_VERSION_STRING "0.8.40+1923"
+#define FW_BUILD_DATE     "2026-08-06 14:00:22"
 
 #endif // BOSEFIX32_VERSION_H

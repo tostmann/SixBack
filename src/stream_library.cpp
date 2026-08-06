@@ -21,8 +21,11 @@ void ensureMutex_() {
     if (!g_mtx) g_mtx = xSemaphoreCreateMutex();
 }
 
-// Caller must hold g_mtx.
-void saveToNVS_() {
+// Caller must hold g_mtx. Returns false when the NVS write failed — the A/B
+// slot save keeps the last good on-flash state, so a failure means the RAM
+// change is simply not persisted (honest-error contract; 144729 #201 showed a
+// stream delete that "succeeded" but never reached NVS at the full partition).
+bool saveToNVS_() {
     JsonDocument doc;
     JsonArray arr = doc["items"].to<JsonArray>();
     for (const auto& it : g_streams) {
@@ -34,7 +37,7 @@ void saveToNVS_() {
         o["contentType"] = it.contentType;
         o["bitrate"]     = it.bitrate;
     }
-    nvsSaveJsonWithCleanup(kNvsNs, kNvsKey, doc);
+    return nvsSaveJsonWithCleanup(kNvsNs, kNvsKey, doc);
 }
 
 }  // namespace
@@ -63,7 +66,8 @@ void init() {
                   (unsigned)g_streams.size());
 }
 
-bool addStreamItem(const StreamItem& item) {
+bool addStreamItem(const StreamItem& item, bool* persisted) {
+    if (persisted) *persisted = false;
     ensureMutex_();
     if (item.streamUrl.length() == 0) return false;
     bool created = true;
@@ -80,14 +84,17 @@ bool addStreamItem(const StreamItem& item) {
         }
     }
     if (created) g_streams.push_back(item);
-    saveToNVS_();
+    bool saved = saveToNVS_();
+    if (persisted) *persisted = saved;
     xSemaphoreGive(g_mtx);
-    Serial.printf("[stream] %s url=%s name=%s\n", created ? "add" : "upd",
-                  item.streamUrl.c_str(), item.name.c_str());
+    Serial.printf("[stream] %s url=%s name=%s%s\n", created ? "add" : "upd",
+                  item.streamUrl.c_str(), item.name.c_str(),
+                  saved ? "" : " (NVS SAVE FAILED — RAM only)");
     return created;
 }
 
-bool removeStreamItem(const String& streamUrl) {
+bool removeStreamItem(const String& streamUrl, bool* persisted) {
+    if (persisted) *persisted = true;  // nothing removed -> nothing to persist
     ensureMutex_();
     if (streamUrl.length() == 0) return false;
     bool removed = false;
@@ -96,9 +103,14 @@ bool removeStreamItem(const String& streamUrl) {
         if (it->streamUrl == streamUrl) { it = g_streams.erase(it); removed = true; }
         else ++it;
     }
-    if (removed) saveToNVS_();
+    bool saved = true;
+    if (removed) {
+        saved = saveToNVS_();
+        if (persisted) *persisted = saved;
+    }
     xSemaphoreGive(g_mtx);
-    if (removed) Serial.printf("[stream] rm url=%s\n", streamUrl.c_str());
+    if (removed) Serial.printf("[stream] rm url=%s%s\n", streamUrl.c_str(),
+                               saved ? "" : " (NVS SAVE FAILED — returns after reboot)");
     return removed;
 }
 

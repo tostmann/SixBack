@@ -211,9 +211,17 @@ static String xmlEsc_(const String& in) {
 static String buildDevicePresets_(const String& deviceId,
                                   const std::map<String, int>& uuidToSrcId) {
     // Wenn der Store keine Presets fuer das Device hat, KEIN <presets>-Element
-    // ausgeben — das gibt dem Speaker das Signal "Cloud sagt nichts dazu" und
-    // verhindert dass er seinen Local-Cache mit unserer leeren Liste
-    // ueberschreibt (siehe handleDevicePresets-Kommentar).
+    // ausgeben.
+    //
+    // ⚠️ KORREKTUR 2026-08-07: hier stand frueher, das weggelassene Element
+    // verhindere, dass der Speaker seinen Local-Cache ueberschreibt. Das ist
+    // FALSCH und hat zwei Massenverluste ueberlebt (2026-05-20, 2026-08-06).
+    // Die Bose-FW liest den fehlenden Block als "Cloud-Account hat keine
+    // Presets" und LEERT den Cache; nur ein 404 auf Request-Ebene schuetzt.
+    // Der leere String hier ist deshalb KEINE Schutzmassnahme, sondern nur
+    // die korrekte Serialisierung eines leeren Slice — der Schutz sitzt im
+    // Per-Device-Gate in handleAccountFull, das so einen Block gar nicht
+    // erst an den anfragenden Speaker ausliefert.
     if (!sixback::PresetStore::instance().hasAnyFor(deviceId)) {
         return String();
     }
@@ -374,6 +382,20 @@ void handleAccountFull(AsyncWebServerRequest* req) {
     std::vector<sixback::Speaker> matched;
     for (const auto& s : allSpeakers) if (s.accountId == acct) matched.push_back(s);
     if (matched.empty()) matched = allSpeakers;
+    // Inventory (noch) komplett leer — z.B. im fresh-erase-Fenster, bevor
+    // die Discovery es wieder gefuellt hat, waehrend die Speaker bereits
+    // gegen uns pollen: dann gibt es keinen Device-Block, den wir sicher
+    // ausliefern koennten. Das alte flotten-weite Gate 404te hier implizit
+    // (beide any*-Flags false); das Per-Device-Gate unten wuerde bei leerem
+    // matched aber DURCHFALLEN (Schleife ueber null Elemente -> 200 mit
+    // leerer <devices>-Liste, Verhalten der Bose-FW darauf unbekannt).
+    // Deshalb expliziter Guard: 404 = Speaker behalten ihren Cache.
+    // (Review-Fund 2026-08-07, vor dem ersten Push gefixt.)
+    if (matched.empty()) {
+        Serial.println("[bmx][safe] account/full -> 404 (inventory leer — kein Device-Block lieferbar)");
+        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+        return;
+    }
 
     // Per-Request-Disambiguation 2026-05-22: Bose-Speaker parsen /full nicht
     // per <device deviceid=...>-Match, sondern uebernehmen den ERSTEN <device>-
@@ -385,13 +407,22 @@ void handleAccountFull(AsyncWebServerRequest* req) {
     // Speaker seinen eigenen Block "vorne" sieht. Schwester-Block bleibt
     // dran (Bose-App + group-orchestration brauchen das ggf.), aber der
     // anfragende Speaker greift das erste = sein eigenes.
+    // requesterId wird ZUSAETZLICH zum Re-Ordering gebraucht: das
+    // Wipe-Schutz-Gate unten entscheidet per-Device, und dafuer muss auch der
+    // Ein-Speaker-Fall (matched.size()==1, kein Swap noetig) den Anfrager
+    // kennen. Leer = per Remote-IP nicht zuzuordnen -> Gate faellt unten auf
+    // die konservative Variante zurueck.
     String remoteIp = req->client() ? req->client()->remoteIP().toString() : String();
-    if (!remoteIp.isEmpty() && matched.size() > 1) {
+    String requesterId;
+    if (!remoteIp.isEmpty()) {
         for (size_t i = 0; i < matched.size(); ++i) {
             if (matched[i].ip == remoteIp) {
                 if (i != 0) std::swap(matched[0], matched[i]);
-                Serial.printf("[bmx] account/full: requesting speaker ip=%s -> %s (block re-ordered to first)\n",
-                              remoteIp.c_str(), matched[0].deviceId.c_str());
+                requesterId = matched[0].deviceId;
+                if (matched.size() > 1) {
+                    Serial.printf("[bmx] account/full: requesting speaker ip=%s -> %s (block re-ordered to first)\n",
+                                  remoteIp.c_str(), requesterId.c_str());
+                }
                 break;
             }
         }
@@ -400,9 +431,11 @@ void handleAccountFull(AsyncWebServerRequest* req) {
     // Boot-Load-Fail-Gate (FHEM 144729 #153, 2026-07-17): konnte der
     // Preset-Store beim Boot NICHT geladen werden, obwohl ein Blob in NVS
     // LIEGT (unlesbar/korrupt), ist jeder 200er hier brandgefaehrlich —
-    // die anyMediaServers-Lockerung unten wuerde Device-Bloecke OHNE
-    // <presets>-Element ausliefern und die Speaker wipen ihre Caches
-    // (Vorfall 2026-05-20, s.u.), obwohl der User Presets HAT. Dann lieber
+    // hasAnyFor() liest dann fuer JEDES Device false, das Per-Device-Gate
+    // unten wuerde konsequent 404 liefern, aber verlassen wollen wir uns
+    // darauf nicht: die Speaker wipen ihre Caches, sobald doch ein Block ohne
+    // <presets>-Element rausgeht (Vorfall 2026-05-20), obwohl der User
+    // Presets HAT. Dann lieber
     // pauschal 404 (Speaker behalten den Cache) — bis der erste
     // erfolgreiche Save den defekten Blob ersetzt hat (loescht das Flag;
     // auch Recovery via import-from-device bleibt so moeglich, weil die
@@ -415,35 +448,81 @@ void handleAccountFull(AsyncWebServerRequest* req) {
         return;
     }
 
-    // Defense (Race-Fix 2026-05-20): wenn KEIN matched Speaker Presets im
-    // Store hat, returnen wir 404 statt account/full mit fehlendem
-    // <presets>-Block pro Device. Symmetrisch zu handleAccountPresets +
-    // handleDevicePresets — Speaker behaelt damit seinen Local-Cache.
-    // Sobald auch nur EIN Speaker im Store seeded ist, laeuft der Pfad
-    // normal und buildDevicePresets_ greift per-Device.
+    // Wipe-Schutz, PER-DEVICE (2026-08-07). Ersetzt das fruehere flotten-weite
+    // Gate `!anySeeded && !anyMediaServers`.
     //
-    // Vorfall 2026-05-20: alle 3 SoundTouch-Speaker im Lab verloren ihre
-    // Presets nach mehrfachen Erase+Flash-Zyklen. Defense in
-    // buildDevicePresets_ returnte leeren String (kein <presets>-Element);
-    // der Speaker hat das offenbar als "Cloud-Account hat keine Presets"
-    // interpretiert und seinen Cache geleert — anstatt wie bei 404
-    // ("Cloud antwortet nicht") seinen Cache zu behalten.
-    bool anySeeded = false;
-    bool anyMediaServers = false;
-    for (const auto& s : matched) {
-        if (sixback::PresetStore::instance().hasAnyFor(s.deviceId)) anySeeded = true;
-        if (!s.mediaServerUuids.empty()) anyMediaServers = true;
-    }
-    // 2026-05-21: Defense gelockert — wenn der Speaker mediaServerUuids hat,
-    // muessen wir das Bosman-Schema mit den UUID-Sources auch ohne Presets
-    // ausliefern, sonst kann der Speaker nach Migration STORED_MUSIC mit
-    // sourceAccount=UUID/0 nie auf READY setzen. Test 2026-05-21 mit Küche
-    // (presets leer, 3 DLNA-UUIDs bekannt) zeigte: ohne diesen Fix bleibt
-    // /full=404 und Küche kennt die UUID-Sources nicht.
-    if (!anySeeded && !anyMediaServers) {
-        Serial.println("[bmx][safe] account/full -> 404 (kein Preset-Store + keine UUIDs — schuetzt Speaker-Cache)");
-        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
-        return;
+    // Warum ueberhaupt ein Gate: ein 200 mit einem <device>-Block OHNE
+    // <presets>-Element liest die Bose-FW als "Cloud-Account hat keine
+    // Presets" und LEERT ihren lokalen Cache. Nur 404 ("Cloud antwortet
+    // nicht") laesst den Cache stehen. buildDevicePresets_ liefert fuer ein
+    // ungeseedetes Device genau so einen leeren String.
+    //
+    // Warum das alte Gate nicht reichte (Vorfall 2026-08-06/07, identisch zu
+    // 2026-05-20): beide Bedingungen waren flotten-weit. Nach einem
+    // fresh-erase des Sticks, der die Speaker besitzt, war der Store leer,
+    // aber `refreshMediaServers()` hatte Kueches DLNA-UUIDs schon wieder
+    // gefuellt -> anyMediaServers==true -> Gate feuerte NICHT -> 200 ohne
+    // <presets> -> ALLE drei Speaker haben ihren Cache geleert. Spaeter hielt
+    // umgekehrt ein einziger geseedeter Speaker (anySeeded==true) das Gate
+    // fuer die beiden leeren offen. Ein Gate, das die ganze Flotte am
+    // schwaechsten Glied ausrichtet, schuetzt niemanden.
+    //
+    // Neue Regel, symmetrisch zu handleAccountPresets + handleDevicePresets
+    // (die das laengst per-Device machen): es zaehlt nur, ob DER ANFRAGENDE
+    // Speaker geseedet ist — denn nur er wertet diese Antwort aus. Ein
+    // ungeseedeter Schwester-Block ist ungefaehrlich, weil der Anfrager per
+    // Remote-IP auf Position 0 sortiert wird und laut 05-22-Befund den
+    // ERSTEN Block als seinen eigenen State uebernimmt.
+    //
+    // Die mediaServerUuids-Lockerung von 2026-05-21 entfaellt — als BEWUSSTER
+    // Trade-off, nicht weil sie ueberfluessig gewesen waere: die
+    // STORED_MUSIC-Source-Registrierung passiert nachweislich beim
+    // /full-Pull (P0a-Befund 2026-05-21, Pi5-Proxy-Capture: Bosman macht
+    // nichts ausser GET /full; dass ein Speaker den separaten
+    // /sources-Endpoint jemals zieht, ist NICHT belegt). Ein ungeseedeter
+    // Speaker mit DLNA-Servern bekommt seine UUID-Sources deshalb erst,
+    // wenn sein Store-Slice das erste Preset traegt (dann 200 inkl.
+    // Sources-Block).
+    //
+    // Kein Henne-Ei und keine Sackgasse (2026-08-07 verifiziert):
+    //  - Der DLNA-BROWSE haengt NICHT am Speaker. /api/dlna/browse spricht
+    //    UPnP direkt vom Stick zum Medienserver (server-scoped, s. dort) —
+    //    der User kann also auch auf einem virgin Speaker DLNA durchsuchen
+    //    und ein DLNA-Preset in den Store legen. Das seedet den Slice ->
+    //    naechster /full-Pull liefert 200 inkl. Sources -> Speaker
+    //    registriert STORED_MUSIC -> Preset spielbar.
+    //  - Die Registrierung ist am Speaker PERSISTENT: Greta hat einen
+    //    kompletten Ausflug auf einen fremden Stick mit ausschliesslich
+    //    404-Antworten plus zwei Reboots ueberstanden und beide
+    //    STORED_MUSIC-sourceItems READY behalten.
+    // Rest-Effekt ist damit: beim ALLERERSTEN DLNA-Preset eines virgin
+    // Speakers liegt ein /full-Zyklus (beobachtet ~30-60 s) zwischen
+    // Speichern und Abspielbarkeit. Vorher /select -> 500 UNKNOWN_SOURCE
+    // (Befund A). Das ist der Preis; er heilt sich selbst.
+    //
+    // Wipe-Schutz schlaegt Virgin-Bootstrap: ein 200 ohne <presets> ist
+    // unter keinen Umstaenden sicher (Vorfaelle 2026-05-20 + 2026-08-06,
+    // beide durch genau diese Lockerung).
+    if (!requesterId.isEmpty()) {
+        if (!sixback::PresetStore::instance().hasAnyFor(requesterId)) {
+            Serial.printf("[bmx][safe] account/full %s -> 404 (store empty fuer den Anfrager — Speaker behaelt Cache)\n",
+                          requesterId.c_str());
+            req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+            return;
+        }
+    } else {
+        // Anfrager per Remote-IP NICHT zuzuordnen (IP-Wechsel, Proxy, leere
+        // Client-Info): dann ist unbekannt, wer Block 0 adoptiert. Nur
+        // ausliefern, wenn JEDES matched Device geseedet ist — sonst koennte
+        // der Anfrager ausgerechnet den leeren Block erwischen.
+        for (const auto& s : matched) {
+            if (!sixback::PresetStore::instance().hasAnyFor(s.deviceId)) {
+                Serial.printf("[bmx][safe] account/full -> 404 (Anfrager ip=%s unbekannt, %s ungeseedet — Speaker behalten Cache)\n",
+                              remoteIp.c_str(), s.deviceId.c_str());
+                req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+                return;
+            }
+        }
     }
 
     String body;

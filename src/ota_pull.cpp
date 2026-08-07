@@ -312,12 +312,29 @@ bool pullAndFlashOne_(const char* path, int updateType,
         : (20UL * 60UL * 1000UL);
     if (kPhaseMaxMs < 5UL * 60UL * 1000UL) kPhaseMaxMs = 5UL * 60UL * 1000UL;
     while (http.connected()) {
-        if (millis() - phaseStartMs > kPhaseMaxMs) {
+        const uint32_t nowMs     = millis();
+        const uint32_t elapsedMs = nowMs - phaseStartMs;
+        if (elapsedMs > kPhaseMaxMs) {
             free(buf);
+            // 2026-08-06 (Lab, C6 auf dem Weg nach v0.8.41): dieser Guard hat bei
+            // VOLLEM Tempo (~35 KB/s, >10x ueber den unterstellten 3 KB/s) nach
+            // ~26 s gefeuert und dabei "exceeded 9 min" gemeldet — Meldung und
+            // echte Laufzeit sind unvereinbar, die Ursache ist OFFEN (die
+            // uint32-Differenz ist wrap-sicher, ein millis()-Ueberlauf erklaert es
+            // nicht; ein Retry lief unter gleichen Bedingungen glatt durch).
+            // Solange das ungeklaert ist, tragen wir die ROHEN Zaehler in der
+            // Meldung mit: elapsed/budget/start/now zeigen beim naechsten Vorfall
+            // sofort, ob wirklich Zeit vergangen ist oder der Vergleich luegt —
+            // und zwar auch im Feld, wo niemand einen Serial-Mitschnitt hat.
+            // setError_ loggt die Meldung ohnehin auf Serial, ein zweiter Print
+            // waere Dopplung.
             setError_(String(phaseName) + ": phase exceeded " +
                       String(kPhaseMaxMs / 60000UL) +
                       " min wall-clock at " + String(written) + "/" +
-                      String(contentLen) + " B — aborting (link too slow / stalled)");
+                      String(contentLen) + " B — aborting (link too slow / stalled)" +
+                      " [elapsed=" + String(elapsedMs) + "ms budget=" +
+                      String(kPhaseMaxMs) + "ms start=" + String(phaseStartMs) +
+                      " now=" + String(nowMs) + "]");
             Update.abort();
             http.end();
             return false;

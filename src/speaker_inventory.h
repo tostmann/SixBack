@@ -119,11 +119,20 @@ public:
         SpeakerInventory& inv_;
     };
 
-    // Laedt persistierte Speaker aus NVS in den RAM-cache.
+    // Laedt persistierte Speaker aus NVS in den RAM-cache. Liest die
+    // Per-Speaker-Slices (>= v0.8.43); liegt (auch zusaetzlich, nach einer
+    // unterbrochenen Migration) noch der Legacy-Gesamtblob "speakers"
+    // (<= v0.8.42), werden dessen noch nicht geslicete Speaker ergaenzt
+    // und die Migration erneut angestossen.
     void loadFromNVS();
 
-    // Persistiert aktuellen Cache. false = NVS-Write fehlgeschlagen (zaehlt
-    // saveFails_ hoch — /api/status inventory.save_fails, UI-Badge).
+    // Persistiert aktuellen Cache — seit dem Slicing pro Speaker einzeln
+    // (eigener NVS-Key je deviceId) plus einem kleinen Order-Key fuer die
+    // Anzeige-Reihenfolge. Der A/B-Unchanged-Skip macht den Vollsweep
+    // billig: real geschrieben werden nur geaenderte Slices. false = mind.
+    // ein Slice-Write fehlgeschlagen (zaehlt saveFails_ hoch — /api/status
+    // inventory.save_fails, UI-Badge); die uebrigen Slices sind trotzdem
+    // persistiert (kein Alles-oder-nichts mehr wie beim Gesamtblob).
     bool saveToNVS();
 
     // Fehlgeschlagene saveToNVS() seit Boot (runtime-only, kein NVS).
@@ -218,6 +227,33 @@ public:
 private:
     SpeakerInventory() = default;
     uint32_t saveFails_ = 0;   // fehlgeschlagene saveToNVS() seit Boot
+    // Eine Speaker-Slice unter ihrem deviceId-Key persistieren (A/B-Save
+    // via nvsSaveJsonWithCleanup). Zaehlt NICHT selbst — saveFails_ zaehlt
+    // zentral in saveToNVS().
+    bool saveSpeakerToNVS_(const Speaker& s);
+    // Anzeige-Reihenfolge ({"ids":[...]} unter "order") persistieren;
+    // bei leerem Inventory wird der Key geloescht statt leer geschrieben.
+    bool saveOrderToNVS_();
+    // Legacy-Gesamtblob -> Slices. Phase A schreibt NEBEN den Blob; passt
+    // das nicht (Partition eng), Druck-Migration: Blob zuerst loeschen
+    // (Stand liegt vollstaendig im RAM), dann erneut. Verbleibende Fails
+    // lassen die Slice RAM-only bis Platz frei wird.
+    void migrateLegacyBlob_();
+    // Migrations-Guard: rechnet den Entry-Bedarf aller noch fehlenden
+    // Slices (haveSliceIds = schon vorhandene, deren Re-Save der
+    // Unchanged-Skip gratis macht) gegen verfuegbare Entries + das, was
+    // das Loeschen des Legacy-Blobs freigibt. Bewusst KONSERVATIV (obere
+    // Schranke via Klartext-Laenge + Gate-Marge je Slice): ein falsches
+    // "GO" strandet die Druck-Migration nach geloeschtem Blob — ein
+    // falsches "STAY-LEGACY" kostet nur einen Boot Aufschub.
+    bool migrationFits_(const std::vector<String>& haveSliceIds);
+    // Fallback-Persistenz fuer Partitionen, auf denen migrationFits_ die
+    // Slice-Migration ablehnt: der Gesamtblob-Save wie vor dem Slicing.
+    bool saveLegacyBlobToNVS_();
+    // Sortiert speakers_ nach der Id-Liste; nicht genannte bleiben in
+    // bisheriger relativer Reihenfolge hinten. Gemeinsamer Kern von
+    // reorder() (mit Save) und loadFromNVS() (ohne).
+    void applyOrder_(const std::vector<String>& deviceIdOrder);
     void mergeSpeaker_(const Speaker& s);
     bool probeIp_(const String& ip, Speaker& out,
                   uint16_t connectMs = 800, uint16_t readMs = 1500,
@@ -235,6 +271,13 @@ private:
     void initMutex_();
 
     std::atomic<bool> scanRunning_{false};
+
+    // true = per-Speaker-Slices (Normalfall, auch fresh), false = die
+    // Partition war beim Boot zu voll fuer eine sichere Slice-Migration
+    // (migrationFits_) -> Persistenz laeuft weiter ueber den Legacy-
+    // Gesamtblob. Wird nur in loadFromNVS() entschieden; der naechste
+    // Boot prueft neu.
+    bool slicedMode_ = true;
 
     mutable SemaphoreHandle_t mx_ = nullptr;
 

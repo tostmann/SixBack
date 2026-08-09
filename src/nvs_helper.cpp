@@ -279,27 +279,43 @@ static bool packPayload_(JsonDocument& doc, String& s,
     return true;
 }
 
+// Eine NVS-Page ist permanent als GC-Spare reserviert und nie fuer Daten
+// nutzbar (IDF File-System-Considerations: "One page is always reserved
+// and never used for data storage"). nvs_get_stats() zaehlt ihre Entries
+// trotzdem als frei — free_entries ist also um genau eine Page zu
+// optimistisch (4096 B / 32 B = 128, minus Page-Header + Entry-State-
+// Bitmap = 126 Daten-Entries, NVS_CONST_ENTRY_COUNT im IDF). Das
+// available_entries-Feld, das die Reserve rausrechnet, gibt es erst in
+// neueren IDFs — der Arduino-Core hier hat es nicht, daher selbst abziehen.
+static constexpr size_t kNvsReservedPageEntries = 126;
+
 // Gate + putBytes + Logging. WRITE-GATE (Lab-Befund 2026-07-17): ein
 // putBytes, das mangels Platz MITTEN im Multi-Chunk-Blob-Write abbricht,
 // hinterlaesst einen inkonsistenten Blob — danach schlagen selbst
 // Kleinst-Writes fehl (wrote=0 bei 792 B / 135 freien Entries beobachtet)
 // und nvs_flash_init raeumt den Key beim NAECHSTEN BOOT komplett weg:
 // Totalverlust mit Fresh-Install-Optik. Writes, die nicht sicher passen,
-// werden gar nicht erst versucht. free_entries ist zudem KEIN hinreichender
-// Erfolgs-Praediktor (Chunk-Geometrie) — deshalb ist die eigentliche
-// Verlust-Absicherung der A/B-Slot-Mechanismus (nvsSaveJsonAB_), das Gate
-// reduziert nur die Wedge-Wahrscheinlichkeit.
+// werden gar nicht erst versucht. Der 07-17-Wedge ging durchs alte Gate,
+// weil es gegen das ungefilterte free_entries prueft hat: 135 "frei" waren
+// real 135-126=9 nutzbare Entries, der 792-B-Write brauchte ~25. Mit
+// abgezogener Reserve haette das Gate ihn REFUSED. Rest-Unschaerfe
+// (Chunk-Geometrie ueber Page-Grenzen) bleibt — deshalb ist die
+// eigentliche Verlust-Absicherung weiterhin der A/B-Slot-Mechanismus
+// (nvsSaveJsonAB_), das Gate reduziert die Wedge-Wahrscheinlichkeit.
 static bool writeBlobGated_(Preferences& p, const char* ns, const char* key,
                             const uint8_t* data, size_t dlen,
                             size_t jsonLen, bool hs) {
     nvs_stats_t st{};
     if (nvs_get_stats(NULL, &st) == ESP_OK) {
-        const size_t needed = dlen / 32 + (dlen / 4000) * 2 + 10;
-        if (needed > st.free_entries) {
+        const size_t needed = nvsEntriesNeededForBlob(dlen);
+        const size_t avail  = st.free_entries > kNvsReservedPageEntries
+                            ? st.free_entries - kNvsReservedPageEntries : 0;
+        if (needed > avail) {
             Serial.printf("[nvs-save] REFUSED ns=%s key=%s blob=%u (brauche ~%u entries, "
-                          "frei %u) — Write nicht gestartet\n",
+                          "verfuegbar %u = frei %u - GC-Reserve %u) — Write nicht gestartet\n",
                           ns, key, (unsigned)dlen, (unsigned)needed,
-                          (unsigned)st.free_entries);
+                          (unsigned)avail, (unsigned)st.free_entries,
+                          (unsigned)kNvsReservedPageEntries);
             return false;
         }
     }
@@ -383,6 +399,24 @@ static bool nvsSaveJsonAB_(const char* ns, const char* key, JsonDocument& doc) {
     const char* oldKey    = activeIs0 ? key : k1.c_str();
     const char* oldGenKey = activeIs0 ? g0k.c_str() : g1k.c_str();
 
+    // Unchanged-Skip: ist der aktive Slot byte-identisch zum neuen Stand,
+    // gibt es nichts zu schreiben — kein Flash-Wear, und an der vollen
+    // Partition entfaellt der transiente alt+neu-Peak. Noetig, seit die
+    // per-Slice-Vollsweeps (Inventory/PresetStore saveToNVS) auch
+    // ungeaenderte Slices durchreichen. Kein Log — der Skip ist der
+    // Normalfall im Sweep, das wuerde jede Serial-Session fluten.
+    if ((g0 | g1) != 0) {
+        size_t blen = p.getBytesLength(oldKey);
+        if (blen == dlen && dlen > 0) {
+            std::unique_ptr<uint8_t[]> cur(new (std::nothrow) uint8_t[dlen]);
+            if (cur && p.getBytes(oldKey, cur.get(), dlen) == dlen &&
+                memcmp(cur.get(), data, dlen) == 0) {
+                p.end();
+                return true;
+            }
+        }
+    }
+
     // Ziel-Slot raeumen (Stale-Reste von vorvorigem Save) — inhaerent safe,
     // der aktive Slot wird hier NIE angefasst.
     p.remove(tgtKey);
@@ -434,6 +468,82 @@ bool nvsErase(const char* ns, const char* key) {
     bool ok = p.remove(key);
     p.end();
     return ok;
+}
+
+// "<id>", "<id>~", "<id>#0", "<id>#1" -> "<id>" (die A/B-Suffixe aus
+// slotKeys_). Alles andere unveraendert.
+static String abBaseIdFromKey_(const char* k) {
+    String s(k);
+    if (s.endsWith("~")) return s.substring(0, s.length() - 1);
+    if (s.length() >= 2 && s.charAt(s.length() - 2) == '#') {
+        const char c = s.charAt(s.length() - 1);
+        if (c == '0' || c == '1') return s.substring(0, s.length() - 2);
+    }
+    return s;
+}
+
+void nvsListAbBaseIds(const char* ns,
+                      const char* const* excludeBaseIds, size_t excludeCount,
+                      std::vector<String>& out) {
+    nvs_iterator_t it = nullptr;
+    esp_err_t err = nvs_entry_find("nvs", ns, NVS_TYPE_ANY, &it);
+    while (err == ESP_OK && it != nullptr) {
+        nvs_entry_info_t info{};
+        nvs_entry_info(it, &info);
+        String base = abBaseIdFromKey_(info.key);
+        bool skip = base.length() == 0;
+        for (size_t i = 0; !skip && i < excludeCount; ++i) {
+            if (base == excludeBaseIds[i]) skip = true;
+        }
+        // Dedupe linear — die Stores halten <= ~20 Basis-Ids.
+        if (!skip) {
+            for (auto& b : out) { if (b == base) { skip = true; break; } }
+        }
+        if (!skip) out.push_back(base);
+        err = nvs_entry_next(&it);
+    }
+    if (it) nvs_release_iterator(it);
+}
+
+void nvsEraseAbKeys(const char* ns, const char* baseKey) {
+    Preferences p;
+    if (!p.begin(ns, false)) return;
+    const String k1 = String(baseKey) + "~";
+    const String g0 = String(baseKey) + "#0";
+    const String g1 = String(baseKey) + "#1";
+    if (p.isKey(baseKey))    p.remove(baseKey);
+    if (p.isKey(k1.c_str())) p.remove(k1.c_str());
+    if (p.isKey(g0.c_str())) p.remove(g0.c_str());
+    if (p.isKey(g1.c_str())) p.remove(g1.c_str());
+    p.end();
+}
+
+size_t nvsEntriesNeededForBlob(size_t dlen) {
+    return dlen / 32 + (dlen / 4000) * 2 + 10;
+}
+
+size_t nvsAvailableEntries() {
+    nvs_stats_t st{};
+    if (nvs_get_stats(NULL, &st) != ESP_OK) return SIZE_MAX;
+    return st.free_entries > kNvsReservedPageEntries
+         ? st.free_entries - kNvsReservedPageEntries : 0;
+}
+
+size_t nvsAbBlobEntries(const char* ns, const char* baseKey) {
+    Preferences p;
+    if (!p.begin(ns, true)) return 0;
+    const String k1 = String(baseKey) + "~";
+    const String g0 = String(baseKey) + "#0";
+    const String g1 = String(baseKey) + "#1";
+    size_t entries = 0;
+    size_t l0 = p.isKey(baseKey)    ? p.getBytesLength(baseKey)    : 0;
+    size_t l1 = p.isKey(k1.c_str()) ? p.getBytesLength(k1.c_str()) : 0;
+    if (l0) entries += (l0 + 31) / 32 + 1;   // Daten-Chunks + BLOB_IDX
+    if (l1) entries += (l1 + 31) / 32 + 1;
+    if (p.isKey(g0.c_str())) entries += 1;   // Gen-Entries (u32 = 1 Entry)
+    if (p.isKey(g1.c_str())) entries += 1;
+    p.end();
+    return entries;
 }
 
 bool nvsEraseAllInNamespace(const char* ns) {

@@ -26,6 +26,14 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+// Gap-Heal-Bruecke aus api_endpoints.cpp (Wrapper am Datei-Ende dort; die
+// eigentliche Import-Implementierung liegt in deren anonymem Namespace).
+// Deklaration MUSS vor dem anonymen Namespace hier stehen, sonst bekommt
+// sie internal linkage und der Linker findet die Definition nicht.
+// Semantik: HW-Presets fuellen nur Store-Luecken, belegte Slots gewinnen.
+int importPresetsFillEmptyForHeal(const String& id, int& countOk,
+                                  int& countAban, int& httpCodeOut);
+
 namespace {
 
 void send200(AsyncWebServerRequest* r) { r->send(200, "text/plain", ""); }
@@ -208,6 +216,59 @@ static String xmlEsc_(const String& in) {
 // in matched-speakers). Ohne diese Map wuerden OPAQUE-Slots auf eine
 // nicht-existente source-id verweisen und der Speaker wuerde den Slot
 // verwerfen.
+// -----------------------------------------------------------------------------
+// Gap-Heal (2. Verlustpfad, am Blech bewiesen 2026-08-07): traegt der beim
+// Boot geladene Slice eines Speakers einen Gap-Marker (Save-Fail vor dem
+// Reboot -> moegliche Luecke gegenueber dem Geraet), liefern die Cloud-Mock-
+// Endpoints 404 — eine unvollstaendige <presets>-Liste wuerde den fehlenden
+// Slot AM GERAET loeschen (am Blech gemessen: binnen ~30-60 s, ohne Reboot,
+// ohne dass jemand den Speaker anfasst). Der 404
+// ist fuer die Bose-FW "Cloud antwortet nicht" und laesst den Cache stehen.
+// Damit das kein Dauerzustand wird, stoesst der erste gegatete Poll diesen
+// Task an: HW-Presets vom Geraet ziehen und die RAM-Luecken fuellen — danach
+// ist der RAM vollstaendig, der naechste Poll (~30-60 s) bekommt wieder 200.
+// Der persistente Marker verschwindet erst mit einem erfolgreichen NVS-Save;
+// bleibt die Partition voll, wiederholt sich Boot->Verdacht->Heilung, das
+// Geraet bleibt dabei durchgehend geschuetzt.
+// -----------------------------------------------------------------------------
+struct GapHealJob_ { String deviceId; };
+
+static void gapHealTask_(void* arg) {
+    auto* job = static_cast<GapHealJob_*>(arg);
+    int countOk = 0, countAban = 0, httpCode = 0;
+    int rc = importPresetsFillEmptyForHeal(job->deviceId, countOk, countAban,
+                                           httpCode);
+    if (rc == 200) {
+        // RAM ist jetzt vollstaendig (Luecken aus HW gefuellt) — auch wenn
+        // der NVS-Save weiter scheitert, darf /full wieder ausliefern.
+        sixback::PresetStore::instance().finishGapHeal(job->deviceId, true);
+        Serial.printf("[bmx][heal] %s: HW-Merge ok (%d Preset(s) uebernommen) "
+                      "— naechster Poll liefert wieder voll\n",
+                      job->deviceId.c_str(), countOk);
+    } else {
+        // Speaker nicht erreichbar o.ae. — Verdacht bleibt, der naechste
+        // gegatete Poll versucht es erneut.
+        sixback::PresetStore::instance().finishGapHeal(job->deviceId, false);
+        Serial.printf("[bmx][heal] %s: HW-Pull fehlgeschlagen (rc=%d http=%d) "
+                      "— Gate bleibt, Retry beim naechsten Poll\n",
+                      job->deviceId.c_str(), rc, httpCode);
+    }
+    delete job;
+    vTaskDelete(nullptr);
+}
+
+// 404-Gate-Begleiter: Heil-Task genau einmal je Verdacht anstossen
+// (tryBeginGapHeal dedupliziert — die Speaker pollen alle ~30-60 s).
+static void spawnGapHeal_(const String& deviceId) {
+    if (!sixback::PresetStore::instance().tryBeginGapHeal(deviceId)) return;
+    auto* job = new (std::nothrow) GapHealJob_{deviceId};
+    if (!job) { sixback::PresetStore::instance().finishGapHeal(deviceId, false); return; }
+    if (xTaskCreate(gapHealTask_, "gap-heal", 8192, job, 1, nullptr) != pdPASS) {
+        sixback::PresetStore::instance().finishGapHeal(deviceId, false);
+        delete job;
+    }
+}
+
 static String buildDevicePresets_(const String& deviceId,
                                   const std::map<String, int>& uuidToSrcId) {
     // Wenn der Store keine Presets fuer das Device hat, KEIN <presets>-Element
@@ -510,15 +571,33 @@ void handleAccountFull(AsyncWebServerRequest* req) {
             req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
             return;
         }
+        // 2. Verlustpfad (2026-08-07): Slice VORHANDEN, aber mit Gap-Marker
+        // geladen — eine Liste mit fehlendem Slot loescht den Slot am
+        // Geraet. 404 + Heilung anstossen (s. gapHealTask_ oben).
+        if (sixback::PresetStore::instance().gapSuspect(requesterId)) {
+            Serial.printf("[bmx][safe] account/full %s -> 404 (gap-marker: Slice evtl. lueckenhaft — HW-Merge angestossen)\n",
+                          requesterId.c_str());
+            spawnGapHeal_(requesterId);
+            req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+            return;
+        }
     } else {
         // Anfrager per Remote-IP NICHT zuzuordnen (IP-Wechsel, Proxy, leere
         // Client-Info): dann ist unbekannt, wer Block 0 adoptiert. Nur
-        // ausliefern, wenn JEDES matched Device geseedet ist — sonst koennte
-        // der Anfrager ausgerechnet den leeren Block erwischen.
+        // ausliefern, wenn JEDES matched Device geseedet und lueckenfrei
+        // ist — sonst koennte der Anfrager ausgerechnet den leeren bzw.
+        // lueckigen Block erwischen.
         for (const auto& s : matched) {
             if (!sixback::PresetStore::instance().hasAnyFor(s.deviceId)) {
                 Serial.printf("[bmx][safe] account/full -> 404 (Anfrager ip=%s unbekannt, %s ungeseedet — Speaker behalten Cache)\n",
                               remoteIp.c_str(), s.deviceId.c_str());
+                req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+                return;
+            }
+            if (sixback::PresetStore::instance().gapSuspect(s.deviceId)) {
+                Serial.printf("[bmx][safe] account/full -> 404 (Anfrager ip=%s unbekannt, %s mit gap-marker — HW-Merge angestossen)\n",
+                              remoteIp.c_str(), s.deviceId.c_str());
+                spawnGapHeal_(s.deviceId);
                 req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
                 return;
             }
@@ -900,6 +979,15 @@ void handleAccountPresets(AsyncWebServerRequest* req) {
         req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
         return;
     }
+    // Gap-Marker: Slice evtl. lueckenhaft geladen -> 404 + HW-Merge
+    // (symmetrisch zu handleAccountFull, 2. Verlustpfad 2026-08-07).
+    if (sixback::PresetStore::instance().gapSuspect(matchedDevId)) {
+        Serial.printf("[bmx][safe] /presets %s -> 404 (gap-marker — HW-Merge angestossen)\n",
+                      matchedDevId.c_str());
+        spawnGapHeal_(matchedDevId);
+        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+        return;
+    }
     Serial.printf("[bmx] /presets account-level -> per-device-fix for %s (ip=%s)\n",
                   matchedDevId.c_str(), remoteIp.c_str());
     String body = sixback::PresetStore::instance().toBoseXml(matchedDevId);
@@ -918,6 +1006,15 @@ void handleDevicePresets(AsyncWebServerRequest* req) {
     if (!sixback::PresetStore::instance().hasAnyFor(devId)) {
         Serial.printf("[bmx][safe] /presets %s -> 404 (store empty, Speaker behaelt Cache)\n",
                       devId.c_str());
+        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+        return;
+    }
+    // Gap-Marker: Slice evtl. lueckenhaft geladen -> 404 + HW-Merge
+    // (symmetrisch zu handleAccountFull, 2. Verlustpfad 2026-08-07).
+    if (sixback::PresetStore::instance().gapSuspect(devId)) {
+        Serial.printf("[bmx][safe] /presets %s -> 404 (gap-marker — HW-Merge angestossen)\n",
+                      devId.c_str());
+        spawnGapHeal_(devId);
         req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
         return;
     }

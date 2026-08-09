@@ -703,9 +703,12 @@ struct MigrateJob_ {
 // handleMigrate ruft ihn vor migrate-trigger auf, damit der Speaker NIE eine
 // Migration auf einen leeren Preset-Store erlebt — sonst verliert er beim
 // ersten Sync seinen Local-Cache.
+// onlyFillEmpty=true (Gap-Heal, bose_endpoints): HW-Presets fuellen NUR
+// Slots, die im Store EMPTY sind — belegte Store-Slots gewinnen.
 int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
                               int& httpCodeOut, JsonArray imported,
-                              JsonArray abandoned, bool* persistedOut = nullptr);
+                              JsonArray abandoned, bool* persistedOut = nullptr,
+                              bool onlyFillEmpty = false);
 
 void migrateRevertWorker_(void* arg) {
     auto* job = static_cast<MigrateJob_*>(arg);
@@ -1282,7 +1285,8 @@ void handleRevertPresetToHw(AsyncWebServerRequest* req) {
 //   502 = speaker http != 200 (httpCodeOut gefuellt)
 int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
                               int& httpCodeOut, JsonArray imported,
-                              JsonArray abandoned, bool* persistedOut) {
+                              JsonArray abandoned, bool* persistedOut,
+                              bool onlyFillEmpty) {
     countOk = countAban = 0;
     httpCodeOut = 0;
     if (persistedOut) *persistedOut = true;   // "nichts zu schreiben" gilt als ok
@@ -1384,6 +1388,20 @@ int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
     // der NVS-Kante gescheiterter Save meldete dem Aufrufer trotzdem 200, der
     // Store hielt die Presets nur noch im RAM (weg beim naechsten Boot) — und
     // die UI wusste nichts davon (FHEM 144729 #196). Jetzt durchgereicht.
+    // Gap-Heal-Modus: nur Store-Luecken fuellen — ein Slot, der im Store
+    // belegt ist, traegt moeglicherweise einen User-Edit von NACH dem Boot
+    // und darf nicht vom HW-Stand ueberschrieben werden.
+    if (onlyFillEmpty && !toSet.empty()) {
+        std::vector<sixback::Preset> fill;
+        for (auto& p : toSet) {
+            if (sixback::PresetStore::instance().get(id, p.slot).source ==
+                sixback::PresetSource::EMPTY) {
+                fill.push_back(p);
+            }
+        }
+        toSet.swap(fill);
+        if (toSet.empty()) return 200;   // keine Luecke — nichts zu schreiben
+    }
     if (!toSet.empty()) {
         bool saved = sixback::PresetStore::instance().setSlots(id, toSet);
         if (persistedOut) *persistedOut = saved;
@@ -4850,4 +4868,18 @@ else {
     ui.on("/api/update/check",   HTTP_GET,  handleOtaUpdateCheck);
     ui.on("/api/update/install", HTTP_POST, handleOtaUpdateInstall);
     ui.on("/api/update/status",  HTTP_GET,  handleOtaUpdateStatus);
+}
+
+// -----------------------------------------------------------------------------
+// External-linkage-Bruecke fuer bose_endpoints.cpp (Gap-Heal, 2. Verlustpfad
+// 2026-08-07): importPresetsFromSpeaker_ liegt im anonymen Namespace dieser
+// Datei und ist von aussen nicht linkbar. Der Wrapper bindet den
+// onlyFillEmpty-Modus fest — HW-Presets fuellen nur Store-Luecken, belegte
+// Slots gewinnen.
+// -----------------------------------------------------------------------------
+int importPresetsFillEmptyForHeal(const String& id, int& countOk,
+                                  int& countAban, int& httpCodeOut) {
+    return importPresetsFromSpeaker_(id, countOk, countAban, httpCodeOut,
+                                     JsonArray(), JsonArray(), nullptr,
+                                     /*onlyFillEmpty=*/true);
 }

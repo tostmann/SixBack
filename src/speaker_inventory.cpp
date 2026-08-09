@@ -14,7 +14,11 @@ namespace sixback {
 namespace {
 
 constexpr const char* NVS_NS  = "sixback-inv";
-constexpr const char* NVS_KEY = "speakers";
+constexpr const char* NVS_KEY = "speakers";     // Legacy-Gesamtblob (<= v0.8.42)
+constexpr const char* NVS_ORDER_KEY = "order";  // Anzeige-Reihenfolge der Slices
+// Meta-Keys im Namespace, die bei der Slice-Enumeration nie als deviceId
+// gelten duerfen (nvsListAbBaseIds-Exclude).
+constexpr const char* kInvMetaKeys[] = { NVS_KEY, NVS_ORDER_KEY };
 
 // Hilfs-Regex-frei: einfaches String-extract zwischen <tag> und </tag>
 String xmlValue(const String& xml, const String& tag) {
@@ -162,89 +166,302 @@ static bool deviceIdSafe_(const String& id) {
     return true;
 }
 
+// Ein Speaker als JSON-Objekt — dieselbe Form als Array-Element im
+// Legacy-Gesamtblob "speakers" (<= v0.8.42) und als Root-Objekt eines
+// Per-Speaker-Keys (Key = deviceId, seit dem Slicing). deviceId steht
+// redundant im Slice (self-describing, wie beim PresetStore).
+// Runtime-only-Felder (sourcesReady, offlineStreak, lastSeenMs sowie
+// moduleType/variant aus /info) werden bewusst nicht persistiert.
+static void buildSpeakerJson_(const Speaker& s, JsonObject o) {
+    o["deviceId"]  = s.deviceId;
+    o["name"]      = s.name;
+    o["model"]     = s.model;
+    o["firmware"]  = s.firmware;
+    o["ip"]        = s.ip;
+    o["accountId"] = s.accountId;
+    o["status"]    = (uint8_t)s.status;
+    o["cloudUrl"]  = s.cloudUrl;
+    o["ownedByUs"] = s.ownedByUs;
+    o["groupId"]   = s.groupId;
+    if (s.hidden) o["hidden"] = true;   // nur wenn gesetzt — spart Blob-Bytes
+    if (!s.mediaServerUuids.empty()) {
+        JsonArray msa = o["mediaServerUuids"].to<JsonArray>();
+        for (const auto& uuid : s.mediaServerUuids) msa.add(uuid);
+    }
+    if (!s.spotifyAccounts.empty()) {
+        JsonArray spa = o["spotifyAccounts"].to<JsonArray>();
+        for (const auto& sa : s.spotifyAccounts) {
+            JsonObject sp = spa.add<JsonObject>();
+            sp["sourceAccount"] = sa.sourceAccount;
+            sp["displayName"]   = sa.displayName;
+        }
+    }
+}
+
+// Gegenstueck zu buildSpeakerJson_. false = Eintrag unbrauchbar (unsafe
+// deviceId, Chokepoint s.o.) — Caller ueberspringt ihn.
+static bool parseSpeakerJson_(JsonObject o, Speaker& s) {
+    s.deviceId   = (const char*)o["deviceId"];
+    if (!deviceIdSafe_(s.deviceId)) {   // Altbestand-Hygiene (Chokepoint s.o.)
+        Serial.printf("[inv] NVS entry with unsafe deviceID skipped\n");
+        return false;
+    }
+    s.name       = (const char*)o["name"];
+    s.model      = (const char*)o["model"];
+    s.firmware   = (const char*)o["firmware"];
+    s.ip         = (const char*)o["ip"];
+    s.accountId  = (const char*)o["accountId"];
+    s.status     = (MigrationStatus)(uint8_t)o["status"];
+    s.cloudUrl   = (const char*)(o["cloudUrl"] | "");
+    s.ownedByUs  = o["ownedByUs"] | false;
+    s.lastSeenMs = 0;  // resetten nach reboot
+    s.groupId    = (const char*)(o["groupId"] | "");
+    s.hidden     = o["hidden"] | false;
+    if (o["mediaServerUuids"].is<JsonArray>()) {
+        for (JsonVariant v : o["mediaServerUuids"].as<JsonArray>()) {
+            s.mediaServerUuids.emplace_back((const char*)v);
+        }
+    }
+    if (o["spotifyAccounts"].is<JsonArray>()) {
+        for (JsonObject sp : o["spotifyAccounts"].as<JsonArray>()) {
+            Speaker::SpotifyAccount sa;
+            sa.sourceAccount = (const char*)(sp["sourceAccount"] | "");
+            sa.displayName   = (const char*)(sp["displayName"]   | "");
+            if (sa.sourceAccount.length() > 0) s.spotifyAccounts.push_back(sa);
+        }
+    }
+    return true;
+}
+
 void SpeakerInventory::loadFromNVS() {
     LockGuard g(*this);
-    JsonDocument doc;
-    if (!nvsLoadJson(NVS_NS, NVS_KEY, doc)) {
+    speakers_.clear();
+    // 1) Per-Speaker-Slices (Key = deviceId).
+    std::vector<String> ids;
+    nvsListAbBaseIds(NVS_NS, kInvMetaKeys, 2, ids);
+    size_t sliced = 0;
+    for (auto& id : ids) {
+        JsonDocument doc;
+        if (!nvsLoadJson(NVS_NS, id.c_str(), doc)) {
+            // Slice unlesbar: skip — Discovery + mergeSpeaker_ regenerieren
+            // den Eintrag, der naechste saveToNVS ersetzt den Key.
+            Serial.printf("[inv] slice %s unreadable — skipped\n", id.c_str());
+            continue;
+        }
+        Speaker s;
+        if (!parseSpeakerJson_(doc.as<JsonObject>(), s)) continue;
+        speakers_.push_back(s);
+        ++sliced;
+    }
+    // 2) Legacy-Gesamtblob (<= v0.8.42): beim ersten Boot nach dem Update
+    //    die einzige Quelle; nach einer UNTERBROCHENEN Migration (Reboot
+    //    mitten in Phase A) liegen Blob UND Teil-Slices gleichzeitig —
+    //    dann ergaenzt der Blob die noch fehlenden Speaker, nichts geht
+    //    verloren. (Nur die Reihenfolge der Nachzuegler ist dann
+    //    best-effort, bis der User neu sortiert.)
+    JsonDocument legacy;
+    const bool haveLegacy = nvsLoadJson(NVS_NS, NVS_KEY, legacy);
+    if (haveLegacy) {
+        for (JsonObject o : legacy["speakers"].as<JsonArray>()) {
+            Speaker s;
+            if (!parseSpeakerJson_(o, s)) continue;
+            bool known = false;
+            for (auto& e : speakers_) {
+                if (e.deviceId == s.deviceId) { known = true; break; }
+            }
+            if (!known) speakers_.push_back(s);
+        }
+    }
+    if (speakers_.empty() && !haveLegacy) {
         Serial.println("[inv] no NVS-state, starting fresh");
         return;
     }
-    speakers_.clear();
-    for (JsonObject o : doc["speakers"].as<JsonArray>()) {
-        Speaker s;
-        s.deviceId   = (const char*)o["deviceId"];
-        if (!deviceIdSafe_(s.deviceId)) {   // Altbestand-Hygiene (Chokepoint s.o.)
-            Serial.printf("[inv] NVS entry with unsafe deviceID skipped\n");
-            continue;
+    // 3) Anzeige-Reihenfolge wiederherstellen — die Slice-Enumeration ist
+    //    NVS-Iterationsreihenfolge, nicht die des Users.
+    JsonDocument od;
+    if (nvsLoadJson(NVS_NS, NVS_ORDER_KEY, od)) {
+        std::vector<String> order;
+        for (JsonVariant v : od["ids"].as<JsonArray>()) {
+            order.emplace_back((const char*)v);
         }
-        s.name       = (const char*)o["name"];
-        s.model      = (const char*)o["model"];
-        s.firmware   = (const char*)o["firmware"];
-        s.ip         = (const char*)o["ip"];
-        s.accountId  = (const char*)o["accountId"];
-        s.status     = (MigrationStatus)(uint8_t)o["status"];
-        s.cloudUrl   = (const char*)(o["cloudUrl"] | "");
-        s.ownedByUs  = o["ownedByUs"] | false;
-        s.lastSeenMs = 0;  // resetten nach reboot
-        s.groupId    = (const char*)(o["groupId"] | "");
-        s.hidden     = o["hidden"] | false;
-        if (o["mediaServerUuids"].is<JsonArray>()) {
-            for (JsonVariant v : o["mediaServerUuids"].as<JsonArray>()) {
-                s.mediaServerUuids.emplace_back((const char*)v);
-            }
-        }
-        if (o["spotifyAccounts"].is<JsonArray>()) {
-            for (JsonObject sp : o["spotifyAccounts"].as<JsonArray>()) {
-                Speaker::SpotifyAccount sa;
-                sa.sourceAccount = (const char*)(sp["sourceAccount"] | "");
-                sa.displayName   = (const char*)(sp["displayName"]   | "");
-                if (sa.sourceAccount.length() > 0) s.spotifyAccounts.push_back(sa);
-            }
-        }
-        speakers_.push_back(s);
+        applyOrder_(order);
     }
-    Serial.printf("[inv] loaded %u speakers from NVS\n",
-                  (unsigned)speakers_.size());
+    Serial.printf("[inv] loaded %u speakers from NVS (%u sliced%s)\n",
+                  (unsigned)speakers_.size(), (unsigned)sliced,
+                  haveLegacy ? ", legacy blob present" : "");
+    if (haveLegacy) {
+        if (migrationFits_(ids)) {
+            migrateLegacyBlob_();
+        } else {
+            // Zu voll fuer eine sichere Migration: im Blob-Modus bleiben —
+            // Verhalten wie vor dem Slicing, null Regression. Teil-Slices
+            // einer frueher unterbrochenen Migration zuruecknehmen (Erase
+            // schafft Platz, und der Zustand ist wieder deterministisch);
+            // ihr Inhalt steht laengst im RAM-Union von oben.
+            slicedMode_ = false;
+            for (auto& id : ids) nvsEraseAbKeys(NVS_NS, id.c_str());
+            nvsEraseAbKeys(NVS_NS, NVS_ORDER_KEY);
+            Serial.println("[inv] migration guard: STAY-LEGACY — Gesamtblob-"
+                           "Persistenz bleibt aktiv, naechster Boot prueft neu");
+        }
+    }
+}
+
+bool SpeakerInventory::migrationFits_(const std::vector<String>& haveSliceIds) {
+    size_t need = 0;
+    JsonDocument doc;
+    for (auto& s : speakers_) {
+        bool have = false;
+        for (auto& id : haveSliceIds) {
+            if (id == s.deviceId) { have = true; break; }
+        }
+        if (have) continue;   // Unchanged-Skip macht vorhandene Slices gratis
+        doc.clear();
+        buildSpeakerJson_(s, doc.to<JsonObject>());
+        need += nvsEntriesNeededForBlob(measureJson(doc));
+    }
+    {   // Order-Key
+        doc.clear();
+        JsonArray a = doc["ids"].to<JsonArray>();
+        for (auto& s : speakers_) a.add(s.deviceId);
+        need += nvsEntriesNeededForBlob(measureJson(doc));
+    }
+    const size_t avail   = nvsAvailableEntries();
+    if (avail == SIZE_MAX) return true;   // Stats kaputt: nicht blocken (wie Gate)
+    const size_t reclaim = nvsAbBlobEntries(NVS_NS, NVS_KEY);
+    const bool fits = need <= avail + reclaim;
+    Serial.printf("[inv] migration guard: brauche ~%u entries, verfuegbar %u "
+                  "+ %u blob-reclaim -> %s\n",
+                  (unsigned)need, (unsigned)avail, (unsigned)reclaim,
+                  fits ? "GO" : "STAY-LEGACY");
+    return fits;
+}
+
+void SpeakerInventory::migrateLegacyBlob_() {
+    // Phase A: Slices NEBEN den Legacy-Blob schreiben. Der Unchanged-Skip
+    // im A/B-Save macht bei einer wiederaufgenommenen Migration die schon
+    // vorhandenen Slices gratis.
+    std::vector<String> failed;
+    for (auto& s : speakers_) {
+        if (!saveSpeakerToNVS_(s)) failed.push_back(s.deviceId);
+    }
+    bool orderOk = saveOrderToNVS_();
+    if (failed.empty() && orderOk) {
+        nvsEraseAbKeys(NVS_NS, NVS_KEY);
+        Serial.printf("[inv] migrated %u speaker(s) to per-speaker keys, "
+                      "legacy blob removed\n", (unsigned)speakers_.size());
+        return;
+    }
+    // Druck-Migration (PresetStore-Muster): Gesamtblob + alle Slices passen
+    // nicht GLEICHZEITIG in die Partition — Blob zuerst loeschen (der Stand
+    // liegt vollstaendig im RAM), dann die Nachzuegler erneut.
+    Serial.printf("[inv] migrate phase A: %u slice(s)%s passten nicht NEBEN "
+                  "den legacy blob — Druck-Migration\n",
+                  (unsigned)failed.size(), orderOk ? "" : " + order-key");
+    nvsEraseAbKeys(NVS_NS, NVS_KEY);
+    size_t still = 0;
+    for (auto& id : failed) {
+        Speaker* sp = findById(id);   // Lock haelt der loadFromNVS-Caller
+        if (!sp || !saveSpeakerToNVS_(*sp)) {
+            ++still;
+            Serial.printf("[inv] migrate FAIL %s — Slice bleibt RAM-only "
+                          "bis Platz frei wird\n", id.c_str());
+        }
+    }
+    if (!orderOk) orderOk = saveOrderToNVS_();
+    if (still == 0 && orderOk) {
+        Serial.printf("[inv] migrated %u speaker(s) via Druck-Migration, "
+                      "legacy blob removed\n", (unsigned)speakers_.size());
+    } else {
+        Serial.printf("[inv] migration UNVOLLSTAENDIG: %u Slice(s) RAM-only "
+                      "(NVS weiterhin zu voll)\n", (unsigned)still);
+    }
+}
+
+bool SpeakerInventory::saveSpeakerToNVS_(const Speaker& s) {
+    if (s.deviceId.length() == 0 || s.deviceId.length() > 15) {
+        // NVS-Keys enden bei 15 Zeichen; echte deviceIds (12-hex-MAC)
+        // passen immer. deviceIdSafe_ liesse bis 24 zu — so ein Exot
+        // landet hier und ist ein loggenswerter Sonderfall, kein Crash.
+        Serial.printf("[inv] saveSpeaker REJECT: deviceId '%s' ist kein "
+                      "gueltiger NVS-Key\n", s.deviceId.c_str());
+        return false;
+    }
+    JsonDocument doc;
+    buildSpeakerJson_(s, doc.to<JsonObject>());
+    // Analog PresetStore (FHEM 144729 #153): ein bei Heap-Knappheit
+    // ueberlaufenes JsonDocument (ArduinoJson dropt Nodes still) wuerde
+    // als VALIDES Teil-JSON committed — lieber gar nicht schreiben, der
+    // naechste Save heilt.
+    if (doc.overflowed()) {
+        Serial.println("[inv] saveSpeaker ABORT: JsonDocument overflowed "
+                       "(heap zu knapp) — NVS-Stand bleibt unangetastet");
+        return false;
+    }
+    return nvsSaveJsonWithCleanup(NVS_NS, s.deviceId.c_str(), doc);
+}
+
+bool SpeakerInventory::saveOrderToNVS_() {
+    if (speakers_.empty()) {
+        // Leeres Inventory: Order-Key entsorgen statt {"ids":[]} pflegen.
+        nvsEraseAbKeys(NVS_NS, NVS_ORDER_KEY);
+        return true;
+    }
+    JsonDocument doc;
+    JsonArray a = doc["ids"].to<JsonArray>();
+    for (auto& s : speakers_) a.add(s.deviceId);
+    return nvsSaveJsonWithCleanup(NVS_NS, NVS_ORDER_KEY, doc);
+}
+
+bool SpeakerInventory::saveLegacyBlobToNVS_() {
+    // Fallback fuer Partitionen, auf denen migrationFits_ die Slice-
+    // Migration abgelehnt hat: Gesamtblob-Save wie vor dem Slicing.
+    JsonDocument doc;
+    JsonArray arr = doc["speakers"].to<JsonArray>();
+    for (auto& s : speakers_) {
+        buildSpeakerJson_(s, arr.add<JsonObject>());
+    }
+    bool ok = !doc.overflowed() && nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
+    if (!ok) {
+        saveFails_++;
+        Serial.printf("[inv] saveToNVS FAILED (#%u, legacy mode)\n",
+                      (unsigned)saveFails_);
+    }
+    return ok;
 }
 
 bool SpeakerInventory::saveToNVS() {
     LockGuard g(*this);
-    JsonDocument doc;
-    JsonArray arr = doc["speakers"].to<JsonArray>();
+    if (!slicedMode_) return saveLegacyBlobToNVS_();
+    // Per-Slice-Sweep statt Gesamtblob: der A/B-Peak ist damit die groesste
+    // Einzel-Slice, nicht mehr alt+neu des groessten Einzel-Writes im
+    // System (der 9-Speaker-Blob; freds 6 inventory.save_fails auf v0.8.41).
+    // Der Unchanged-Skip im A/B-Save laesst ungeaenderte Slices aus — real
+    // geschrieben wird nur, was sich geaendert hat.
+    bool all = true;
     for (auto& s : speakers_) {
-        JsonObject o = arr.add<JsonObject>();
-        o["deviceId"]  = s.deviceId;
-        o["name"]      = s.name;
-        o["model"]     = s.model;
-        o["firmware"]  = s.firmware;
-        o["ip"]        = s.ip;
-        o["accountId"] = s.accountId;
-        o["status"]    = (uint8_t)s.status;
-        o["cloudUrl"]  = s.cloudUrl;
-        o["ownedByUs"] = s.ownedByUs;
-        o["groupId"]   = s.groupId;
-        if (s.hidden) o["hidden"] = true;   // nur wenn gesetzt — spart Blob-Bytes
-        if (!s.mediaServerUuids.empty()) {
-            JsonArray msa = o["mediaServerUuids"].to<JsonArray>();
-            for (const auto& uuid : s.mediaServerUuids) msa.add(uuid);
-        }
-        if (!s.spotifyAccounts.empty()) {
-            JsonArray spa = o["spotifyAccounts"].to<JsonArray>();
-            for (const auto& sa : s.spotifyAccounts) {
-                JsonObject sp = spa.add<JsonObject>();
-                sp["sourceAccount"] = sa.sourceAccount;
-                sp["displayName"]   = sa.displayName;
-            }
-        }
+        all = saveSpeakerToNVS_(s) && all;
     }
-    bool ok = nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
-    if (!ok) {
+    all = saveOrderToNVS_() && all;
+    // Verwaiste Slices wegputzen (remove()'te Speaker) — sonst stuenden
+    // sie beim naechsten Boot wieder auf.
+    std::vector<String> ids;
+    nvsListAbBaseIds(NVS_NS, kInvMetaKeys, 2, ids);
+    for (auto& id : ids) {
+        if (!findById(id)) nvsEraseAbKeys(NVS_NS, id.c_str());
+    }
+    // Nach einem vollstaendig persistierten Stand ist ein evtl. noch
+    // liegender Legacy-Blob obsolet (isKey-Guard -> no-op im Normalfall).
+    if (all) nvsEraseAbKeys(NVS_NS, NVS_KEY);
+    if (!all) {
         // Sichtbar machen statt still verlieren (Analog preset_store.save_fails;
         // die Callsites melden dem Client sonst 200 trotz verlorenem Write).
+        // Anders als beim Gesamtblob sind die uebrigen Slices trotzdem
+        // persistiert — ein Fail kostet einen Speaker, nicht alle.
         saveFails_++;
         Serial.printf("[inv] saveToNVS FAILED (#%u)\n", (unsigned)saveFails_);
     }
-    return ok;
+    return all;
 }
 
 void SpeakerInventory::mergeSpeaker_(const Speaker& s) {
@@ -1208,8 +1425,7 @@ std::vector<Speaker> SpeakerInventory::list() {
     return speakers_;
 }
 
-bool SpeakerInventory::reorder(const std::vector<String>& deviceIdOrder) {
-    LockGuard g(*this);  // rekursiv — saveToNVS() nimmt ihn erneut
+void SpeakerInventory::applyOrder_(const std::vector<String>& deviceIdOrder) {
     std::vector<Speaker> reordered;
     reordered.reserve(speakers_.size());
     std::vector<bool> taken(speakers_.size(), false);
@@ -1230,6 +1446,11 @@ bool SpeakerInventory::reorder(const std::vector<String>& deviceIdOrder) {
         if (!taken[i]) reordered.push_back(speakers_[i]);
     }
     speakers_.swap(reordered);
+}
+
+bool SpeakerInventory::reorder(const std::vector<String>& deviceIdOrder) {
+    LockGuard g(*this);  // rekursiv — saveToNVS() nimmt ihn erneut
+    applyOrder_(deviceIdOrder);
     saveToNVS();
     Serial.printf("[inv] reorder applied — %u speakers\n", (unsigned)speakers_.size());
     return true;

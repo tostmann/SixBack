@@ -44,13 +44,26 @@ String baseIdFromKey_(const char* k) {
 // Alle Per-Speaker-Basis-Ids im Namespace (Blob-Slices UND Gen-Keys, damit
 // ein Slice, der nur im Spare-Slot "<id>~" liegt, gefunden wird). Dedupe
 // linear — Flotten sind <= ~20 Geraete.
-void listPerSpeakerIds_(std::vector<String>& out) {
+// gapSuspects (optional): sammelt die Basis-Ids aller Gap-Marker "<id>!"
+// (s. setGapMarker_) — die duerfen NIE als Slice-Key fehlinterpretiert
+// werden, deviceIds sind alnum-only.
+void listPerSpeakerIds_(std::vector<String>& out,
+                        std::vector<String>* gapSuspects = nullptr) {
     nvs_iterator_t it = nullptr;
     esp_err_t err = nvs_entry_find("nvs", NVS_NS, NVS_TYPE_ANY, &it);
     while (err == ESP_OK && it != nullptr) {
         nvs_entry_info_t info{};
         nvs_entry_info(it, &info);
-        if (!isLegacyKeyName_(info.key)) {
+        const size_t klen = strlen(info.key);
+        if (klen > 1 && info.key[klen - 1] == '!') {
+            if (gapSuspects) {
+                String base(info.key);
+                base.remove(base.length() - 1);
+                bool seen = false;
+                for (auto& b : *gapSuspects) { if (b == base) { seen = true; break; } }
+                if (!seen) gapSuspects->push_back(base);
+            }
+        } else if (!isLegacyKeyName_(info.key)) {
             String base = baseIdFromKey_(info.key);
             bool seen = false;
             for (auto& b : out) { if (b == base) { seen = true; break; } }
@@ -72,10 +85,40 @@ void eraseStoreKeys_(const char* baseKey) {
     const String k1 = String(baseKey) + "~";
     const String g0 = String(baseKey) + "#0";
     const String g1 = String(baseKey) + "#1";
+    const String gm = String(baseKey) + "!";
     if (p.isKey(baseKey))    p.remove(baseKey);
     if (p.isKey(k1.c_str())) p.remove(k1.c_str());
     if (p.isKey(g0.c_str())) p.remove(g0.c_str());
     if (p.isKey(g1.c_str())) p.remove(g1.c_str());
+    if (p.isKey(gm.c_str())) p.remove(gm.c_str());
+    p.end();
+}
+
+// Gap-Marker "<id>!" (u8, 1 Entry): persistiert "der NVS-Slice dieses
+// Speakers kann LUECKEN haben" ueber den Reboot — gesetzt bei JEDEM
+// fehlgeschlagenen Slice-Save (der RAM war in dem Moment neuer als der
+// Flash; der naechste Boot laedt den lueckigen Stand), geloescht beim
+// ersten erfolgreichen. Grund (am Blech bewiesen 2026-08-07):
+// eine UNVOLLSTAENDIGE <presets>-Liste ist fuer die Bose-FW keine
+// Unklarheit, sondern eine Ansage — sie verwirft den fehlenden Slot am
+// Geraet binnen eines Poll-Zyklus (~30-60 s), ohne Reboot. Anders als
+// beim komplett leeren Slice (hasAnyFor-Gate) ist die Luecke aus dem
+// geladenen Stand allein nicht erkennbar — dafuer der Marker.
+// Das Loeschen braucht keinen Platz; das Setzen 1 Entry (schlaegt an der
+// absolut vollen Partition fehl -> lauter Log, Verhalten dann wie vor
+// diesem Fix).
+void setGapMarker_(const char* deviceId, bool on) {
+    Preferences p;
+    if (!p.begin(NVS_NS, false)) return;
+    const String k = String(deviceId) + "!";
+    if (on) {
+        if (!p.isKey(k.c_str()) && p.putUChar(k.c_str(), 1) == 0) {
+            Serial.printf("[preset] gap-marker %s NICHT schreibbar (NVS voll) "
+                          "— Boot-Schutz fuer diesen Speaker fehlt\n", deviceId);
+        }
+    } else if (p.isKey(k.c_str())) {
+        p.remove(k.c_str());
+    }
     p.end();
 }
 
@@ -210,9 +253,18 @@ void PresetStore::loadFromNVS() {
         }
     }
 
-    // 2) Per-Speaker-Slices (v0.8.40+).
+    // 2) Per-Speaker-Slices (v0.8.40+). Nebenbei die Gap-Marker einsammeln:
+    //    jeder markierte Slice kann Luecken gegenueber dem Geraet haben
+    //    (Save-Fail vor dem letzten Reboot) -> /full & Co. gaten auf 404,
+    //    bis der HW-Merge die Luecken im RAM gefuellt hat (gapSuspect()).
+    gapSuspectIds_.clear();
+    gapHealInFlight_.clear();
     std::vector<String> sliceIds;
-    listPerSpeakerIds_(sliceIds);
+    listPerSpeakerIds_(sliceIds, &gapSuspectIds_);
+    for (auto& id : gapSuspectIds_) {
+        Serial.printf("[preset] slice %s traegt gap-marker — Auslieferung "
+                      "gated bis HW-Merge/Save\n", id.c_str());
+    }
     std::vector<String> loadedSliceIds;
     for (auto& id : sliceIds) {
         JsonDocument doc;
@@ -432,7 +484,8 @@ bool PresetStore::saveSpeakerToNVS_(const String& deviceId) {
         }
     }
     if (!any) {
-        eraseStoreKeys_(deviceId.c_str());
+        eraseStoreKeys_(deviceId.c_str());   // loescht auch den Gap-Marker
+        healGapRam_(deviceId);
         ++saveOkCount_;             // Zustand hat sich real geaendert/gebessert
         healLoadFail_(deviceId);
         return true;
@@ -446,6 +499,9 @@ bool PresetStore::saveSpeakerToNVS_(const String& deviceId) {
     if (doc.overflowed()) {
         ++saveFails_;
         ++saveHeapAborts_;          // transient: NVS intakt, naechster Save heilt
+        // Auch hier: RAM ist ab jetzt neuer als der Flash — der naechste
+        // Boot laedt einen lueckigen Stand. Marker fuer den Boot-Schutz.
+        setGapMarker_(deviceId.c_str(), true);
         Serial.println("[preset] saveSpeaker ABORT: JsonDocument overflowed "
                        "(heap zu knapp) — NVS-Stand bleibt unangetastet");
         return false;
@@ -453,7 +509,10 @@ bool PresetStore::saveSpeakerToNVS_(const String& deviceId) {
     bool ok = nvsSaveJsonWithCleanup(NVS_NS, deviceId.c_str(), doc);
     if (ok) {
         // Erfolgreicher Slice-Save ersetzt einen ggf. defekten Blob unter
-        // GENAU diesem Key -> dessen Load-Fail-Gate ist geheilt.
+        // GENAU diesem Key -> dessen Load-Fail-Gate ist geheilt. Der
+        // Gap-Marker ist damit gegenstandslos: Flash == RAM.
+        setGapMarker_(deviceId.c_str(), false);
+        healGapRam_(deviceId);
         healLoadFail_(deviceId);
         ++saveOkCount_;             // Generation fuer den Auto-Import-Backoff
     } else {
@@ -461,10 +520,50 @@ bool PresetStore::saveSpeakerToNVS_(const String& deviceId) {
         // ignorierten das Ergebnis bis 2026-07-17 komplett (silent loss).
         ++saveFails_;
         ++saveNvsFails_;            // echter Schreibfehler = Kapazitaetskante
+        // RAM ist ab jetzt neuer als der Flash: der naechste Boot laedt
+        // einen Stand mit Luecke. Marker, damit der Boot das weiss und
+        // /full & Co. gaten koennen (2. Verlustpfad, 2026-08-07).
+        setGapMarker_(deviceId.c_str(), true);
         Serial.printf("[preset] saveSpeaker FAILED (nvs write, #%u) dev=%s\n",
                       (unsigned)saveNvsFails_, deviceId.c_str());
     }
     return ok;
+}
+
+bool PresetStore::gapSuspect(const String& deviceId) {
+    LockGuard g(*this);
+    for (auto& s : gapSuspectIds_) { if (s == deviceId) return true; }
+    return false;
+}
+
+bool PresetStore::tryBeginGapHeal(const String& deviceId) {
+    LockGuard g(*this);
+    bool suspect = false;
+    for (auto& s : gapSuspectIds_) { if (s == deviceId) { suspect = true; break; } }
+    if (!suspect) return false;
+    for (auto& s : gapHealInFlight_) { if (s == deviceId) return false; }
+    gapHealInFlight_.push_back(deviceId);
+    return true;
+}
+
+void PresetStore::finishGapHeal(const String& deviceId, bool healed) {
+    LockGuard g(*this);
+    for (size_t i = 0; i < gapHealInFlight_.size(); ++i) {
+        if (gapHealInFlight_[i] == deviceId) {
+            gapHealInFlight_.erase(gapHealInFlight_.begin() + i);
+            break;
+        }
+    }
+    if (healed) healGapRam_(deviceId);
+}
+
+void PresetStore::healGapRam_(const String& deviceId) {
+    for (size_t i = 0; i < gapSuspectIds_.size(); ++i) {
+        if (gapSuspectIds_[i] == deviceId) {
+            gapSuspectIds_.erase(gapSuspectIds_.begin() + i);
+            break;
+        }
+    }
 }
 
 bool PresetStore::saveToNVS() {

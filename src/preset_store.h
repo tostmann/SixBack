@@ -123,6 +123,29 @@ public:
     // saveToNVS den defekten Blob ersetzt hat. Fresh-Install (kein Blob)
     // setzt das Flag NICHT.
     bool     loadFailedFromNvs() const { return loadFailed_; }
+    // --- Luecken-Verdacht (2. Verlustpfad, am Blech bewiesen 2026-08-07) --
+    // true = der beim Boot geladene NVS-Slice dieses Speakers traegt einen
+    // Gap-Marker: vor dem letzten Reboot ist mindestens ein Slice-Save
+    // fehlgeschlagen, der geladene Stand kann also LUECKEN gegenueber dem
+    // Geraet haben. Eine unvollstaendige <presets>-Liste loescht den
+    // fehlenden Slot AM GERAET binnen ~30-60 s — die Cloud-Mock-Endpoints
+    // gaten deshalb auf 404 (Speaker behaelt Cache) und stossen die
+    // Selbstheilung an (tryBeginGapHeal -> HW-Merge-Task).
+    // Nur der Boot setzt den RAM-Verdacht; ein Save-Fail zur LAUFZEIT
+    // persistiert nur den Marker fuer den naechsten Boot — der laufende
+    // RAM-Stand ist ja vollstaendig und darf weiter ausgeliefert werden.
+    bool gapSuspect(const String& deviceId);
+    // Heil-Task-Handshake: true = Verdacht besteht und noch kein Merge
+    // in-flight -> Caller darf den Task spawnen (verhindert Task-Sturm bei
+    // jedem 30-s-Poll). finishGapHeal raeumt in-flight auf; healed=true
+    // hebt zusaetzlich den RAM-Verdacht auf (der persistente Marker bleibt,
+    // bis ein Slice-Save wirklich durchkommt — ein weiterer Boot mit
+    // lueckigem NVS wird also erneut verdaechtigt und heilt erneut).
+    bool tryBeginGapHeal(const String& deviceId);
+    void finishGapHeal(const String& deviceId, bool healed);
+    // Merge-Richtung der Heilung: HW-Presets fuellen NUR Slots, die im
+    // Store EMPTY sind — belegte Store-Slots gewinnen (dort koennen
+    // User-Edits liegen, die nach dem Boot passiert sind).
     // Fehlgeschlagene saveToNVS() seit Boot (inkl. JsonDocument-Overflow),
     // zentral gezaehlt fuer ALLE Caller (set/setSlots/clear/syncToGroup/
     // importJson) — runtime-only, via /api/status preset_store.save_fails.
@@ -180,7 +203,11 @@ private:
     void migrateLegacyBlob_(const std::vector<String>& haveSlice);
     void healLoadFail_(const String& deviceId);       // Slice-Save heilt Load-Fail
 
+    void healGapRam_(const String& deviceId);  // RAM-Verdacht aufheben (Lock haelt Caller)
+
     mutable SemaphoreHandle_t mx_ = nullptr;
+    std::vector<String> gapSuspectIds_;    // Boot-Load fand Gap-Marker "<id>!"
+    std::vector<String> gapHealInFlight_;  // laufende HW-Merge-Tasks
     bool     loadFailed_ = false;   // abgeleitet: legacyLoadFailed_ || Slices
     bool     legacyLoadFailed_ = false;   // Legacy-Gesamtblob vorhanden, unlesbar
     std::vector<String> loadFailedIds_;   // Per-Speaker-Slices vorhanden, unlesbar

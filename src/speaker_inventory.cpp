@@ -542,7 +542,25 @@ bool SpeakerInventory::probeIp_(const String& ip, Speaker& out,
     out.deviceId  = xmlAttr(xml, "deviceID");
     out.name      = xmlValue(xml, "name");
     out.model     = xmlValue(xml, "type");
+    // Nur den Versionsteil behalten, den Build-Suffix verwerfen:
+    // "27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29"
+    // -> "27.0.6.46330.5043500". Der Suffix wird nirgends ausgewertet, kostet
+    // an der NVS-Kante aber unverhaeltnismaessig viel: die Blob-Kompression
+    // laeuft mit einem 256-B-Fenster (kHsWindow=8), und die 48 Zusatzzeichen
+    // druecken einen Speaker-Eintrag ueber diese Grenze — dadurch koennen
+    // sich die untereinander fast identischen Eintraege nicht mehr
+    // gegenseitig wegkomprimieren. Gemessen an einem 9-Speaker-Blob
+    // (2026-08-10, heatshrink w=8/l=4 gegen die vendored Quelle):
+    // voll 2243 B = 80 Entries, gekuerzt 595 B = 28 Entries -> 52 Entries
+    // frei, ohne ein Feld zu verlieren. Das komplette Weglassen brachte nur
+    // 2 Entries mehr (26) und haette die FW-Whitelist in auto_mode.cpp
+    // (indexOf("27.0.6.")) sowie <firmwareVersion> im /account/full-XML
+    // zwischen Boot und erstem Probe leer laufen lassen.
     out.firmware  = xmlValue(xml, "softwareVersion");
+    {
+        const int sp = out.firmware.indexOf(' ');
+        if (sp > 0) out.firmware.remove(sp);
+    }
     out.moduleType = xmlValue(xml, "moduleType");   // sm2/scm — HW-Revision (Issue-Triage)
     out.variant    = xmlValue(xml, "variant");      // rhino/mojo/spotty
     out.accountId = xmlValue(xml, "margeAccountUUID");

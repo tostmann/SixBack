@@ -512,11 +512,27 @@ void autoModeTask_(void* /*arg*/) {
                        "(re-enable + reboot or wait for cron tick reload)");
     } else {
         delay(cfg.bootDelayMs);
-        runMigrationPass_(cfg, /*deep=*/true);
-        Serial.printf("[auto] initial pass finished. migrated=%d converted=%d "
-                      "abandoned=%d\n",
-                      g_status.speakersMigrated, g_status.slotsConverted,
-                      g_status.slotsAbandoned);
+        // Config NACH dem Warten neu lesen (FHEM 144729 msg1367658, zweite
+        // Haelfte der Zusage). Bis v0.8.43 galt hier die Kopie, die beim
+        // Task-Start geladen wurde: das enabled=false-Flag pruefte der Task
+        // VOR dem delay, ein waehrend des Fensters umgelegter Schalter lief
+        // ins Leere und der Boot-Pass startete trotzdem. Damit war das
+        // Fenster nur eine Wartezeit, kein Abschalt-Fenster — ein laengeres
+        // haette daran nichts geaendert. Jetzt entscheidet der Stand
+        // unmittelbar vor dem ersten Speaker-Zugriff.
+        // Bewusst KEIN Abbruch eines bereits laufenden Passes (Laufzeit-Flag
+        // zwischen zwei Boxen war erwogen und nicht zugesagt) — der Cron-Loop
+        // unten liest ohnehin je Tick neu.
+        cfg = loadAutoModeConfig();
+        if (!cfg.enabled) {
+            Serial.println("[auto] boot pass cancelled — disabled during boot delay");
+        } else {
+            runMigrationPass_(cfg, /*deep=*/true);
+            Serial.printf("[auto] initial pass finished. migrated=%d converted=%d "
+                          "abandoned=%d\n",
+                          g_status.speakersMigrated, g_status.slotsConverted,
+                          g_status.slotsAbandoned);
+        }
     }
 
     // Cron-Loop: alle cronIntervalS Sekunden ein Light-Pass.
@@ -564,9 +580,22 @@ AutoModeConfig loadAutoModeConfig() {
         // die Image-Defaults aus AutoModeConfig.
         c.enabled       = doc["enabled"]         | true;
         c.dryRun        = doc["dry_run"]         | false;
-        c.bootDelayMs   = doc["boot_delay_ms"]   | (uint32_t)10000;
+        c.bootDelayMs   = doc["boot_delay_ms"]   | (uint32_t)20000;
         c.maxPerBoot    = doc["max_per_boot"]    | (uint32_t)4;
         c.cronIntervalS = doc["cron_interval_s"] | (uint32_t)1800;
+
+        // Bestandsgeraete auf das neue Fenster heben. saveAutoModeConfig()
+        // schreibt boot_delay_ms IMMER mit — wer je den Auto-Mode-Schalter
+        // in der UI betaetigt hat, traegt den alten Default 10000 im Flash
+        // und saehe von der zugesagten Verlaengerung sonst nichts (ein
+        // reiner Struct-Default-Bump greift nur bei frischem NVS).
+        // Angehoben wird ausschliesslich der EXAKTE Alt-Default: ein
+        // bewusst abweichender Wert bleibt unangetastet. Der Wert ist
+        // ohnehin nicht UI-exponiert, nur ueber PUT /api/automode setzbar
+        // — ein gespeichertes 10000 ist praktisch immer der Altbestand.
+        // Kein NVS-Write hier: die Anhebung gilt fuer diesen Lauf, der
+        // naechste regulaere Save persistiert sie beilaeufig.
+        if (c.bootDelayMs == 10000) c.bootDelayMs = 20000;
     }
     return c;
 }

@@ -13,8 +13,9 @@
 //      account/full-XML → Speaker sync't sie an, kein Long-Press noetig
 //      (Lessons-Item 7).
 //
-// Gated durch AutoModeConfig::enabled (default false). Hard-Limit
-// AutoModeConfig::maxPerBoot (default 1) als Foot-Gun-Guard.
+// Gated durch AutoModeConfig::enabled (Image-Default s. SIXBACK_AUTOMODE_DEFAULT
+// unten: an, ausser in Probe-Builds). Hard-Limit AutoModeConfig::maxPerBoot
+// (default 4) als Foot-Gun-Guard.
 #ifndef BOSEFIX32_AUTO_MODE_H
 #define BOSEFIX32_AUTO_MODE_H
 
@@ -36,7 +37,14 @@ namespace sixback {
 struct AutoModeConfig {
     bool      enabled       = SIXBACK_AUTOMODE_DEFAULT;  // Image-Default an: flash → provision → migrate zero-touch
     bool      dryRun        = false;
-    uint32_t  bootDelayMs   = 10000;
+    // 20 s statt der frueheren 10 (FHEM 144729 msg1367658, oeffentlich
+    // zugesagt): das Fenster startet NICHT beim Einschalten, sondern erst
+    // wenn provisionWifi() mit stehender STA zurueckkehrt (main.cpp) — beim
+    // frisch geflashten Stick also in dem Moment, in dem der Nutzer die IP
+    // gerade erst sieht. 10 s reichten nicht, um die Automatik vor ihrem
+    // ersten Zugriff abzuschalten. Bestandsgeraete mit gespeicherten 10000
+    // werden beim Laden angehoben, s. loadAutoModeConfig().
+    uint32_t  bootDelayMs   = 20000;
     uint32_t  maxPerBoot    = 4;      // typischer Haushalt 1-4 SoundTouch — alle in einem Boot durch
     uint32_t  cronIntervalS = 1800;   // periodischer Check alle 30 min wenn enabled
                                        //   - light discovery (SSDP + knownIpProbe, kein /24-Sweep)

@@ -21,12 +21,23 @@ namespace ota {
 
 namespace {
 
-// Manifest-Quelle. sixback.io ist seit 2026-05-25 die kanonische Domain
-// (siehe reference_sixback_io_domain). Apache-vhost auf demselben Hetzner-Host
-// wie install.busware.de — DocumentRoot /var/www/install/sixback/, also
-// 1:1 Spiegel ohne /sixback/-Prefix.
-constexpr const char* kManifestUrl =
-    "https://sixback.io/manifest.json";
+// Basis-URL fuer Manifest UND Artefakte. sixback.io ist seit 2026-05-25 die
+// kanonische Domain (siehe reference_sixback_io_domain). Apache-vhost auf
+// demselben Hetzner-Host wie install.busware.de — DocumentRoot
+// /var/www/install/sixback/, also 1:1 Spiegel ohne /sixback/-Prefix.
+//
+// Per build_flag uebersteuerbar (-D SIXBACK_OTA_BASE_URL='"…/"'). Das nutzen
+// die Max-Targets: sie liegen komplett unter /max/ und bekommen damit ein
+// EIGENES manifest.json. Das ist keine Kosmetik — haengen Max-Geraete am
+// gemeinsamen Manifest, meldet jedes Release ihnen sofort eine neue Version,
+// auch wenn die Max-Binaries noch gar nicht hochgeladen sind; der Pull laeuft
+// dann auf 404. Mit eigenem Manifest steigt die Max-Version erst, wenn ihre
+// Artefakte danebenliegen. MUSS auf "/" enden.
+#ifndef SIXBACK_OTA_BASE_URL
+#define SIXBACK_OTA_BASE_URL "https://sixback.io/"
+#endif
+constexpr const char* kBaseUrl     = SIXBACK_OTA_BASE_URL;
+constexpr const char* kManifestUrl = SIXBACK_OTA_BASE_URL "manifest.json";
 
 // Chip-spezifischer Datei-Name fuer firmware.bin oder littlefs.bin.
 // build_release.sh erzeugt:
@@ -165,7 +176,7 @@ void doCheck_() {
 // Return true on success.
 bool pullAndFlashOne_(const char* path, int updateType,
                       const char* phaseName, uint8_t phaseIdx) {
-    String url = "https://sixback.io/";
+    String url = kBaseUrl;   // Standard "https://sixback.io/", Max "…/max/"
     url += path;
     Serial.printf("[ota-pull] phase %d/%u start: %s -> %s\n",
                   phaseIdx, (unsigned)g_status.phaseN, url.c_str(),

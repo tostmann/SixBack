@@ -296,4 +296,94 @@ write_manifest "$OUT/manifest-update-c5-16mb.json" <<EOF
 }
 EOF
 
-echo ">>> manifests written to $OUT (version=$VERSION)"
+# --- e) SixBack-Max: 16-MB-Layout mit grosser NVS ------------------------
+# Fuer Installationen mit vielen Speakern (partitions-16mb-max.csv: NVS 220 KB
+# statt 20 KB, 6930 statt 630 Entries).
+#
+# ALLES Max liegt unter $OUT/max/ — Seite, Manifeste UND Artefakte. Das ist
+# nicht Ordnungsliebe, sondern die OTA-Entkopplung: die Max-Firmware zieht ihr
+# Manifest von SIXBACK_OTA_BASE_URL = https://sixback.io/max/ (ota_pull.cpp).
+# Haengen Max-Geraete dagegen am gemeinsamen /manifest.json, meldet ihnen JEDES
+# Standard-Release sofort eine neue Version — auch wenn die Max-Binaries noch
+# nicht hochgeladen sind — und ihr Pull laeuft auf 404. Mit eigenem Manifest
+# steigt die Max-Version erst, wenn ihre Artefakte danebenliegen.
+#
+# Je EIN Manifest fuer beide Chips: esp-web-tools waehlt den Build per
+# chipFamily, und die Firmware liest ohnehin nur "version" (die Dateinamen
+# baut sie selbst aus SIXBACK_OTA_PREFIX). Ein Button genuegt also pro Zweck.
+#
+# NICHT in manifests.json des generischen Installers eintragen und NICHT auf
+# der Hauptseite verlinken — die Variante wird gezielt an Betroffene ausgegeben.
+#
+# ⚠️ DER NAME IST DIE SICHERUNG, NICHT DIE KOSMETIK.
+# Max hat andere Flash-Offsets: app0 @0x50000 (nicht 0x10000), spiffs @0x650000
+# (nicht 0x610000). Die Partitionstabelle wird von OTA NIE geschrieben, ein
+# Geraet behaelt also die Tabelle seines Erst-Flashs — im Feld existieren zwei
+# Generationen nebeneinander. esp-web-tools matcht den ueber Improv gemeldeten
+# Firmware-Namen EXAKT gegen manifest.name; die Max-Firmware meldet
+# "SixBack-Max" (env:s3-max / env:c5-16mb-max setzen -D FW_NAME). Dadurch:
+#   - ein Max-Geraet am Standard-Update-Manifest  -> Name passt nicht, kein
+#     stiller Update-Write mit 0x10000-Offsets (der die App auf NVS+otadata
+#     schreiben und das FS-Image in app1 legen wuerde);
+#   - ein Standard-Geraet am Max-Update-Manifest  -> ebenso abgewiesen.
+# Wer FW_NAME und diese "name"-Felder auseinanderlaufen laesst, hebelt genau
+# diesen Schutz aus. Sie muessen zusammen geaendert werden oder gar nicht.
+mkdir -p "$OUT/max"
+
+write_manifest "$OUT/max/manifest.json" <<EOF
+{
+  "name": "SixBack-Max",
+  "version": "$VERSION",
+  "funding_url": "https://paypal.me/busware",
+  "new_install_prompt_erase": true,
+  "sixback": { "kind": "factory", "variant": "max" },
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "sixback": { "target": "s3-max", "minFlashSize": "16MB", "psram": "required" },
+      "parts": [
+        { "path": "sixback-s3-max-factory.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32-C5",
+      "sixback": { "target": "c5-16mb-max", "minFlashSize": "16MB", "psram": "none" },
+      "parts": [
+        { "path": "sixback-c5-16mb-max-factory.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
+EOF
+
+# "name" exakt FW_NAME der Max-Builds ("SixBack-Max").
+# Offsets: app @0x50000 = 327680, spiffs @0x650000 = 6619136.
+write_manifest "$OUT/max/manifest-update.json" <<EOF
+{
+  "name": "SixBack-Max",
+  "version": "$VERSION",
+  "funding_url": "https://paypal.me/busware",
+  "new_install_prompt_erase": true,
+  "sixback": { "kind": "update", "variant": "max" },
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "sixback": { "target": "s3-max", "minFlashSize": "16MB", "psram": "required" },
+      "parts": [
+        { "path": "sixback-s3-max-firmware.bin", "offset": 327680  },
+        { "path": "sixback-s3-max-littlefs.bin", "offset": 6619136 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32-C5",
+      "sixback": { "target": "c5-16mb-max", "minFlashSize": "16MB", "psram": "none" },
+      "parts": [
+        { "path": "sixback-c5-16mb-max-firmware.bin", "offset": 327680  },
+        { "path": "sixback-c5-16mb-max-littlefs.bin", "offset": 6619136 }
+      ]
+    }
+  ]
+}
+EOF
+
+echo ">>> manifests written to $OUT + $OUT/max (version=$VERSION)"

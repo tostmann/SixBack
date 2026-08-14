@@ -11,4 +11,10 @@ Disallow: /snapshots/
 Disallow: /proxy/
 Disallow: /*.bin$
 
+# /max/ is the build for installations with an unusually large number of
+# speakers. It is handed out deliberately, not browsed to: installing it
+# requires a full erase, and it is pointless for everyone else. Kept out of
+# the index so nobody lands there by search (the page also sends noindex).
+Disallow: /max/
+
 Sitemap: https://sixback.io/sitemap.xml

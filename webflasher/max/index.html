@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SixBack-Max — Web Flasher</title>
+<meta name="robots" content="noindex,nofollow">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="SixBack-Max — build for installations with many speakers. Larger settings storage.">
+<style>
+  :root {
+    --bg:#f7f6f3; --card:#fff; --ink:#222; --mute:#777;
+    --ok:#1f7a3a; --warn:#b86c00; --bad:#a32525; --accent:#7a3e00;
+    --line:#e1ddd2;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+         max-width: 46em; margin: 0 auto; padding: 1.5em 1em;
+         color: var(--ink); background: var(--bg); line-height: 1.55; }
+  h1 { color: var(--accent); margin: .2em 0; font-weight: 600; font-size: 1.8em; }
+  h2 { color: var(--accent); font-weight: 600; font-size: 1.25em; margin: 1.6em 0 .4em; }
+  h3 { margin: 0 0 .4em; font-size: 1.05em; }
+  p  { margin: .6em 0; }
+  a  { color: var(--accent); }
+  code { background: #fee; padding: .1em .35em; border-radius: 3px; font-size: .9em; }
+  .hero { text-align: center; padding: 1em 0 .6em; }
+  .hero img { max-width: 100%; height: auto; }
+  .panel { background: var(--card); border: 1px solid var(--line);
+           border-radius: 10px; padding: 1.4em 1.3em; margin: 1em 0; }
+  .panel.flash { text-align: center; }
+  esp-web-install-button { --esp-tools-button-color: var(--accent);
+                           --esp-tools-button-text-color: #fff; }
+  .btnrow { display: flex; flex-wrap: wrap; gap: 1.4em; justify-content: center;
+            margin: 1.1em 0 .4em; }
+  .choice { min-width: 13em; }
+  .fineprint { color: var(--mute); font-size: .9em; text-align: left; }
+  .warn { background: #fce8d2; border-left: 4px solid var(--warn);
+          padding: .9em 1.1em; border-radius: 0 6px 6px 0; margin: 1em 0;
+          text-align: left; }
+  .stop { background: #fbdada; border-left: 4px solid var(--bad); }
+  table.num { border-collapse: collapse; margin: .8em 0; font-size: .92em; }
+  table.num td, table.num th { border: 1px solid var(--line); padding: .35em .7em;
+                               text-align: right; }
+  table.num th:first-child, table.num td:first-child { text-align: left; }
+  table.num th { background: #f0ede6; font-weight: 600; }
+  footer { margin-top: 2.4em; padding-top: 1em; border-top: 1px solid var(--line);
+           color: var(--mute); font-size: .85em; text-align: center; }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <img src="/images/sixback-logo.png" alt="SixBack" width="280">
+  <h1>SixBack-Max</h1>
+  <p style="color:var(--mute)">Same SixBack — room for a lot more speakers.<br>
+     Version <code id="ver">…</code></p>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Who this is for</h2>
+  <p>SixBack keeps every speaker's presets in the ESP32's settings area. That
+     area is small, and each speaker takes a slice of it: roughly 26 entries for
+     a speaker's presets, 28 for the speaker list, 29 for a Spotify login.</p>
+  <p>With a handful of speakers that is comfortable. At around <b>nine or
+     more</b> it fills up — and once it is full, <b>nothing more can be
+     written</b>, not even the write that would free space again. Symptoms:
+     a preset that stays on <code>PUSH</code> and never corrects itself, a
+     Spotify login that is gone after every restart, settings that silently
+     refuse to save.</p>
+  <p><b>SixBack-Max</b> is the ordinary SixBack with a much larger settings
+     area. Everything else is identical — same features, same Web UI, same
+     updates.</p>
+  <table class="num">
+    <tr><th>Storage entries</th><th>Standard</th><th>Max</th></tr>
+    <tr><td>Total</td><td>630</td><td>6930</td></tr>
+    <tr><td>Usable after reserve</td><td>504</td><td>6804</td></tr>
+    <tr><td>Comfortable up to roughly</td><td>8 speakers</td><td>far beyond</td></tr>
+  </table>
+  <p class="fineprint">If your stick is not actually running out of room, stay
+     on the standard build — there is nothing to gain here.</p>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Before you flash — two things</h2>
+
+  <div class="warn stop">
+    <b>1. Your presets will be erased from the stick.</b><br>
+    Max rearranges the flash memory, so it can only be installed as a complete
+    fresh write — settings and presets on the stick do not survive it.
+    <b>Export your presets first</b>: in the SixBack Web UI, use the export
+    button on each speaker's preset row and keep the files. After flashing,
+    provide your WiFi again and import them back.<br>
+    Your speakers themselves keep their presets throughout — it is the stick's
+    copy that is rebuilt.
+  </div>
+
+  <div class="warn">
+    <b>2. Only for boards with 16&nbsp;MB flash.</b><br>
+    The <code>N16</code> in a module name means 16&nbsp;MB. On a smaller board
+    the write fails partway through. If you are unsure which board you have,
+    the <a href="/boards.html">board identification page</a> tells you.
+  </div>
+</div>
+
+<div class="panel flash">
+  <h3>Install</h3>
+  <p class="fineprint" style="text-align:center">Supported: <b>ESP32-S3</b> and
+     <b>ESP32-C5</b>, both with 16&nbsp;MB flash. The right image is picked for
+     your chip automatically.</p>
+  <p class="btnrow">
+    <span class="choice">
+      <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install — writes everything</small>
+    </span>
+    <span class="choice">
+      <esp-web-install-button manifest="manifest-update.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update an existing Max stick — keeps settings</small>
+    </span>
+  </p>
+  <p class="fineprint">
+    Manual flashing (esptool) — S3:
+    <a href="sixback-s3-max-factory.bin">factory</a> @0x0 ·
+    <a href="sixback-s3-max-firmware.bin">firmware</a> @0x50000 ·
+    <a href="sixback-s3-max-littlefs.bin">littlefs</a> @0x650000<br>
+    C5 (needs esptool&nbsp;≥&nbsp;5):
+    <a href="sixback-c5-16mb-max-factory.bin">factory</a> @0x0 ·
+    <a href="sixback-c5-16mb-max-firmware.bin">firmware</a> @0x50000 ·
+    <a href="sixback-c5-16mb-max-littlefs.bin">littlefs</a> @0x650000
+  </p>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Afterwards</h2>
+  <p>A Max stick reports itself as <b>SixBack-Max</b> — you will see that name
+     in the Web UI status line. Everything else works exactly as before.</p>
+  <p><b>Updates work as usual</b> — over WiFi from the stick's own
+     <b>⚙&nbsp;SYSTEM&nbsp;→&nbsp;Update</b>, or from this page over USB. A Max
+     stick looks for its updates here under <code>/max/</code>, so it only ever
+     sees releases that actually ship a Max build.</p>
+  <p>You cannot accidentally mix the two builds: because the names differ, the
+     standard flasher will not update a Max stick, and this page will not
+     update a standard one.</p>
+  <p class="fineprint">Going back to the standard build works the same way as
+     coming here — a fresh install from the
+     <a href="/">main flasher page</a>, with the same export-first advice.</p>
+</div>
+
+<footer>
+  SixBack &copy; 2026 Dirk Tostmann &middot;
+  <a href="https://github.com/tostmann/SixBack" target="_blank" rel="noopener">source &amp; bug reports</a>
+  &middot; noncommercial use only
+  (<a href="https://polyformproject.org/licenses/noncommercial/1.0.0" target="_blank" rel="noopener">PolyForm-NC&nbsp;1.0.0</a>,
+  commercial inquiries: <code>tostmann@gmail.com</code>)
+  &middot; requires Chrome/Edge on desktop
+  &middot; not affiliated with Bose Corporation.
+</footer>
+
+<script type="module"
+        src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<script>
+  fetch('manifest.json').then(r => r.json()).then(m => {
+    document.getElementById('ver').textContent = m.version || '?';
+  }).catch(() => {});
+</script>
+</body>
+</html>

@@ -44,6 +44,11 @@ compile_commands.json
 # Generierte esp-web-tools-Manifeste (alle Varianten — build_release.sh schreibt
 # auch manifest-s3-8mb.json + manifest-update-s3-8mb.json, Issue #23)
 webflasher/manifest*.json
+# ... und die der Max-Variante, die in einem Unterverzeichnis liegen: das
+# Pattern oben matcht NUR direkt in webflasher/, nicht in webflasher/max/.
+# Die .bin dort deckt bereits das globale *.bin ab; die Seite selbst
+# (webflasher/max/index.html) ist Quelle und bleibt getrackt.
+webflasher/max/manifest*.json
 ._*
 .DS_Store
 

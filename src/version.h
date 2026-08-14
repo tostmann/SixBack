@@ -4,12 +4,19 @@
 #ifndef BOSEFIX32_VERSION_H
 #define BOSEFIX32_VERSION_H
 
+// FW_NAME ist per build_flags uebersteuerbar (-D FW_NAME='"..."'). Das nutzt
+// env:s3-max / env:c5-16mb-max: der Improv-Firmware-Name wird von esp-web-tools
+// exakt gegen manifest.name gematcht, und die Max-Variante MUSS ein eigenes
+// Update-Manifest bekommen (andere Partitionstabelle => andere Flash-Offsets).
+// Gleicher Name = falsche Offsets = zerschossenes Geraet. Siehe gen_manifests.sh.
+#ifndef FW_NAME
 #define FW_NAME           "SixBack"
+#endif
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  8
-#define FW_VERSION_BUILD  1951
+#define FW_VERSION_BUILD  2052
 
-#define FW_VERSION_STRING "0.8.41+1951"
-#define FW_BUILD_DATE     "2026-08-07 13:29:53"
+#define FW_VERSION_STRING "0.8.44+2052"
+#define FW_BUILD_DATE     "2026-08-14 11:41:32"
 
 #endif // BOSEFIX32_VERSION_H

@@ -8,6 +8,10 @@
 # Plus:
 #   webflasher/manifest.json                 — esp-web-tools manifest with VERSION
 #
+# SixBack-Max (Targets s3-max, c5-16mb-max) landet komplett in webflasher/max/
+# — eigene Partitionstabelle, eigener Firmware-Name, eigener OTA-Pfad. Siehe
+# den Block bei den Max-Manifesten in scripts/gen_manifests.sh.
+#
 # Run from project root.  Requires PlatformIO env active.
 
 set -euo pipefail
@@ -57,8 +61,8 @@ fi
 # partitions-4mb.csv. Followup umgesetzt: scripts/fs_exclude_esp32.py strippt
 # silence.mp3 (Spotify-only, ~120 KB) NUR fuer env:esp32 aus dem FS-Image
 # (PROJECT_DATA_DIR -> gefilterte Staging-Kopie). Damit passt esp32 wieder rein.
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e c5-16mb -e esp32 -t buildfs
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e c5-16mb -e esp32
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e c5-16mb -e esp32 -e s3-max -e c5-16mb-max -t buildfs
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e c5-16mb -e esp32 -e s3-max -e c5-16mb-max
 
 # Resolve final version: tag if set, else read the core from version.h.
 # Dev FW_VERSION_STRING carries a "+<counter>" suffix (e.g. "0.8.4+1116");
@@ -88,6 +92,11 @@ APP_16MB=$((0x300000))       # 3.145.728 — app0/app1 in partitions.csv (s3)
 FS_16MB=$((0x9E0000))        # 10.354.688 — spiffs in partitions.csv
 APP_8MB=$((0x300000))        # 3.145.728 — app0/app1 in partitions-8mb.csv (s3-8mb)
 FS_8MB=$((0x1E0000))         #  1.966.080 — spiffs in partitions-8mb.csv
+# Max-Layout (partitions-16mb-max.csv): App-Slots UNVERAENDERT 3 MB — die grosse
+# NVS wird allein aus spiffs bezahlt. Ein Max-Build hat damit exakt denselben
+# App-Spielraum wie der Standard-16-MB-Build und kann nicht heimlich enger werden.
+APP_16MB_MAX=$((0x300000))   # 3.145.728 — app0/app1 in partitions-16mb-max.csv
+FS_16MB_MAX=$((0x9A0000))    # 10.092.544 — spiffs in partitions-16mb-max.csv
 
 size_errors=0
 check_size() {
@@ -123,6 +132,11 @@ check_size "$PIO_BUILD/s3-8mb/littlefs.bin" $FS_8MB       "s3-8mb fs"
 # C5-16MB (N16R8): gleiches 16-MB-Layout wie s3 (partitions.csv).
 check_size "$PIO_BUILD/c5-16mb/firmware.bin" $APP_16MB    "c5-16mb app"
 check_size "$PIO_BUILD/c5-16mb/littlefs.bin" $FS_16MB     "c5-16mb fs"
+# Max-Targets (partitions-16mb-max.csv): grosse NVS, spiffs 256 KB kleiner.
+check_size "$PIO_BUILD/s3-max/firmware.bin"      $APP_16MB_MAX "s3-max app"
+check_size "$PIO_BUILD/s3-max/littlefs.bin"      $FS_16MB_MAX  "s3-max fs"
+check_size "$PIO_BUILD/c5-16mb-max/firmware.bin" $APP_16MB_MAX "c5-16mb-max app"
+check_size "$PIO_BUILD/c5-16mb-max/littlefs.bin" $FS_16MB_MAX  "c5-16mb-max fs"
 
 if [ "$size_errors" -gt 0 ]; then
   echo >&2
@@ -137,20 +151,31 @@ ESPTOOL=( "$HOME/.platformio/penv/bin/pio" pkg exec --package "platformio/tool-e
 
 merge_target() {
   local tgt="$1" chip="$2" fsize="$3" spiffs_off="$4" boot_off="$5"
+  # 6. Parameter = app0-Offset. Default 0x10000 gilt fuer ALLE Standard-Layouts;
+  # nur die Max-Targets (partitions-16mb-max.csv, grosse NVS) schieben app0 auf
+  # 0x50000. Wer hier einen Offset falsch setzt, erzeugt ein Factory-Image, das
+  # die App neben ihre Partition legt — das Geraet boot-loopt ab dem Flash.
+  local app_off="${6:-0x10000}"
+  # 7. Parameter = Unterverzeichnis in $OUT. Max-Artefakte liegen unter max/,
+  # weil die Max-Firmware ihr Manifest UND ihre Dateien von
+  # https://sixback.io/max/ zieht (SIXBACK_OTA_BASE_URL, ota_pull.cpp).
+  local subdir="${7:-}"
+  local out="$OUT${subdir:+/$subdir}"
+  mkdir -p "$out"
   local src="$PIO_BUILD/$tgt"
-  local factory="$OUT/sixback-$tgt-factory.bin"
+  local factory="$out/sixback-$tgt-factory.bin"
 
-  echo ">>> Merging $tgt ($chip, $fsize, boot@$boot_off, spiffs@$spiffs_off)"
+  echo ">>> Merging $tgt ($chip, $fsize, boot@$boot_off, app@$app_off, spiffs@$spiffs_off)"
   "${ESPTOOL[@]}" --chip "$chip" merge_bin \
     -o "$factory" \
     --flash_mode dio --flash_size "$fsize" --flash_freq 80m \
     "$boot_off"   "$src/bootloader.bin" \
     0x8000        "$src/partitions.bin" \
-    0x10000       "$src/firmware.bin" \
+    "$app_off"    "$src/firmware.bin" \
     "$spiffs_off" "$src/littlefs.bin"
 
-  cp "$src/firmware.bin"  "$OUT/sixback-$tgt-firmware.bin"
-  cp "$src/littlefs.bin"  "$OUT/sixback-$tgt-littlefs.bin"
+  cp "$src/firmware.bin"  "$out/sixback-$tgt-firmware.bin"
+  cp "$src/littlefs.bin"  "$out/sixback-$tgt-littlefs.bin"
 }
 
 # bootloader offset:
@@ -158,9 +183,11 @@ merge_target() {
 #   S3 / C3 / C6 / S2 / C2 / H2: 0x0
 #   ESP32-C5 / C61 / P4: 0x2000  (8-KB-Key-Manager-Sektor davor; verifiziert an
 #       IDF-Doku + esptool ESP32C5ROM.BOOTLOADER_FLASH_OFFSET + 0xE9 @ 0x2000)
-# spiffs offsets must match the corresponding partition table:
-#   partitions.csv     (16 MB)     -> spiffs @ 0x610000   (s3)
-#   partitions-4mb.csv ( 4 MB A/B) -> spiffs @ 0x3B0000   (esp32-classic + c3/c6)
+# app0- und spiffs-Offsets muessen zur jeweiligen Partitionstabelle passen:
+#   partitions.csv          (16 MB)     -> app @0x10000, spiffs @0x610000  (s3)
+#   partitions-8mb.csv      ( 8 MB)     -> app @0x10000, spiffs @0x610000  (s3-8mb)
+#   partitions-4mb.csv      ( 4 MB A/B) -> app @0x10000, spiffs @0x3B0000  (esp32 + c3/c6/c5)
+#   partitions-16mb-max.csv (16 MB Max) -> app @0x50000, spiffs @0x650000  (*-max)
 #       Wer das mal wieder anpasst: hier mitziehen, sonst landet das
 #       LittleFS-Image im falschen Flash-Bereich und der Web-Flasher
 #       liefert kaputte Factory-Images aus.
@@ -169,6 +196,8 @@ merge_target s3     esp32s3 16MB 0x610000  0x0
 merge_target s3-8mb esp32s3 8MB  0x610000  0x0      # Seeed XIAO u.a. (Issue #23)
 merge_target c3     esp32c3 4MB  0x3B0000  0x0
 merge_target c6     esp32c6 4MB  0x3B0000  0x0
+# Max: grosse NVS -> app0 und spiffs verschoben (partitions-16mb-max.csv).
+merge_target s3-max esp32s3 16MB 0x650000  0x0      0x50000  max
 
 # --- C5: eigener Merge (NICHT merge_target) -------------------------------
 # Zwei C5-Spezifika, die merge_target nicht abdeckt:
@@ -214,6 +243,20 @@ PYTHONPATH="$C5_ESPTOOL_PKG" "$HOME/.platformio/penv/bin/python" -m esptool --ch
 cp "$PIO_BUILD/c5-16mb/firmware.bin"  "$OUT/sixback-c5-16mb-firmware.bin"
 cp "$PIO_BUILD/c5-16mb/littlefs.bin"  "$OUT/sixback-c5-16mb-littlefs.bin"
 
+# c5-16mb-max: wie c5-16mb, aber partitions-16mb-max.csv -> app @0x50000,
+# spiffs @0x650000. Die C5-Spezifika (bootloader@0x2000, esptool>=5) bleiben.
+mkdir -p "$OUT/max"
+echo ">>> Merging c5-16mb-max (esp32c5, 16MB, boot@0x2000, app@0x50000, spiffs@0x650000) via $(basename "$C5_ESPTOOL_PKG")"
+PYTHONPATH="$C5_ESPTOOL_PKG" "$HOME/.platformio/penv/bin/python" -m esptool --chip esp32c5 merge_bin \
+  -o "$OUT/max/sixback-c5-16mb-max-factory.bin" \
+  --flash_mode dio --flash_size 16MB --flash_freq 80m \
+  0x2000   "$PIO_BUILD/c5-16mb-max/bootloader.bin" \
+  0x8000   "$PIO_BUILD/c5-16mb-max/partitions.bin" \
+  0x50000  "$PIO_BUILD/c5-16mb-max/firmware.bin" \
+  0x650000 "$PIO_BUILD/c5-16mb-max/littlefs.bin"
+cp "$PIO_BUILD/c5-16mb-max/firmware.bin"  "$OUT/max/sixback-c5-16mb-max-firmware.bin"
+cp "$PIO_BUILD/c5-16mb-max/littlefs.bin"  "$OUT/max/sixback-c5-16mb-max-littlefs.bin"
+
 # --- 3) Manifeste schreiben — ausgelagert nach scripts/gen_manifests.sh ---
 # Der komplette Manifest-Inhalt steht dort und NUR dort: die "name"-Falle des
 # Update-Manifests (falscher Name => esp-web-tools erased das Geraet), die
@@ -226,10 +269,32 @@ bash "$ROOT/scripts/gen_manifests.sh" "$VERSION" "$OUT"
 # Jede in index.html referenzierte Manifest-Datei muss in $OUT existieren —
 # verhindert tote Install-Buttons, wenn die Seite vor den Artefakten deployed
 # wuerde (Praezedenzfall v0.8.10: Page-only-Fix per rsync).
+# Jede Seite wird gegen IHR eigenes Verzeichnis geprueft (Manifest-Referenzen
+# sind relativ zur Seite): webflasher/*.html gegen $OUT, webflasher/max/*.html
+# gegen $OUT/max. Ohne die zweite Schleife koennte die Max-Seite mit toten
+# Buttons rausgehen, ohne dass irgendwer es merkt — sie ist nicht verlinkt,
+# es faellt also erst auf, wenn einer der Nutzer sie oeffnet.
 manifest_missing=0
-for m in $(cat "$OUT"/*.html | grep -oE 'manifest="[^"]+"' | cut -d'"' -f2 | sort -u); do
-  if [ ! -f "$OUT/$m" ]; then
-    echo "ABORT: eine HTML-Seite referenziert $m — fehlt in webflasher/" >&2
+check_page_manifests() {
+  local dir="$1"
+  ls "$dir"/*.html >/dev/null 2>&1 || return 0
+  local m
+  for m in $(cat "$dir"/*.html | grep -oE 'manifest="[^"]+"' | cut -d'"' -f2 | sort -u); do
+    if [ ! -f "$dir/$m" ]; then
+      echo "ABORT: eine HTML-Seite in $dir referenziert $m — fehlt dort" >&2
+      manifest_missing=1
+    fi
+  done
+}
+check_page_manifests "$OUT"
+check_page_manifests "$OUT/max"
+# Die Max-Firmware zieht ihr Manifest von https://sixback.io/max/manifest.json
+# (SIXBACK_OTA_BASE_URL). Fehlt es, laufen alle Max-OTA-Pulls auf 404.
+for f in manifest.json manifest-update.json \
+         sixback-s3-max-factory.bin  sixback-s3-max-firmware.bin  sixback-s3-max-littlefs.bin \
+         sixback-c5-16mb-max-factory.bin sixback-c5-16mb-max-firmware.bin sixback-c5-16mb-max-littlefs.bin; do
+  if [ ! -f "$OUT/max/$f" ]; then
+    echo "ABORT: webflasher/max/$f fehlt — Max-Release waere unvollstaendig" >&2
     manifest_missing=1
   fi
 done
@@ -240,6 +305,12 @@ echo
 echo "=== Release artefacts (version $VERSION) ==="
 ls -lh "$OUT"/*.bin "$OUT"/manifest*.json
 echo
+echo "--- SixBack-Max (eigener OTA-Pfad /max/, nicht verlinkt) ---"
+ls -lh "$OUT"/max/*.bin "$OUT"/max/manifest*.json
+echo
 echo "Public landing page:  https://sixback.io/"
 echo "Deploy command (user triggers manually):"
 echo "  rsync -avr webflasher/ 10.0.0.100:/var/www/install/sixback/   # vServer (sixback.io = 31.70.64.234); 10.10.22.1/install.busware.de ist tot"
+echo "  (-r nimmt webflasher/max/ mit — die Max-Sticks holen ihr Manifest und"
+echo "   ihre Artefakte von https://sixback.io/max/. Wird max/ ausgelassen,"
+echo "   bleiben sie auf ihrer alten Version stehen statt auf 404 zu laufen.)"

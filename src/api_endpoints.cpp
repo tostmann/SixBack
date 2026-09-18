@@ -9,6 +9,7 @@
 //   - Gruppen-Sync (Preset-Set von Speaker A auf B,C,...)
 //   - TuneIn-Lookup + Suche
 
+#include <memory>
 #include "api_endpoints.h"
 #include "web_router.h"
 #include "version.h"
@@ -20,6 +21,7 @@
 #include "preset_store.h"
 #include "tunein_resolver.h"
 #include "system_health.h"
+#include "systimer_blackbox.h"
 #include "captive_portal.h"
 #include "ota_pull.h"
 #include "dlna_browse.h"
@@ -417,7 +419,21 @@ void handleStatus(AsyncWebServerRequest* req) {
     doc["build"]      = FW_BUILD_DATE;
     doc["license"]    = "PolyForm-Noncommercial-1.0.0";
     doc["copyright"]  = "Copyright (c) 2026 Dirk Tostmann";
-    doc["uptime_s"]   = millis() / 1000;
+    // Capability-Flags (Issue #43): die WebUI blendet aus, was dieses Target
+    // gar nicht mitgebaut hat. Auf env:esp32 fehlt SIXBACK_SPOTIFY_ENABLED, die
+    // /api/spotify/*-Routes existieren dort nicht -> jeder UI-Call lief in ein
+    // echtes 404 (inkl. eines 5-s-Pollers). Fehlt das Feld ganz, ist die
+    // Firmware aelter als dieser Fix -> die UI nimmt dann "vorhanden" an.
+    JsonObject features = doc["features"].to<JsonObject>();
+#ifdef SIXBACK_SPOTIFY_ENABLED
+    features["spotify"] = true;
+#else
+    features["spotify"] = false;
+#endif
+    // Sprungbereinigt statt roh: auf dem C6 (rev v0.0) laeuft millis() sichtbar
+    // rueckwaerts. Das rohe millis() steht weiterhin als health.uptime_raw_s
+    // daneben — die Differenz der beiden IST die Diagnose.
+    doc["uptime_s"]   = sixback::monoUptimeS();
 
     JsonObject wifi   = doc["wifi"].to<JsonObject>();
     wifi["connected"] = WiFi.status() == WL_CONNECTED;
@@ -4637,12 +4653,62 @@ void handleDbgContig(AsyncWebServerRequest* req) {
 }
 #endif
 
+// GET /api/dbg/blackbox — Vollausgabe der SYSTIMER-Blackbox (nur c6 bestueckt,
+// sonst leeres Objekt). Bewusst ein eigener Endpoint: die Sample-Zeilen sind
+// mehrere KB und haben in /api/status nichts verloren. Zweiter Zweck: die
+// rt0-/INT_RAW-Instrumentierung im GESUNDZUSTAND pruefbar machen — bis 2081
+// waren diese Werte nur nach einem Panic sichtbar, ein Offset-Fehler waere
+// also erst am Hauptereignis aufgefallen.
+// GECHUNKT, nicht als Response-Stream. Die Vorgaengerfassung baute alle drei
+// Ringe in ein JsonDocument und serialisierte das in einen
+// AsyncResponseStream — beides gleichzeitig im Heap, was auf dem C6 die
+// Allokation abreisst und ueber einen durchdrehenden async_tcp-Task in den
+// TWDT-Reboot laeuft. Der Endpoint hat damit genau die Messung zerstoert, die
+// er ausgeben sollte. Jetzt formatiert die Blackbox je Aufruf ein paar Zeilen
+// direkt in den Chunk-Puffer; der Zustand haengt am shared_ptr, den die
+// Lambda haelt, und sein Destruktor gibt die Snapshot-Sperre zurueck — auch
+// wenn der Client mittendrin abbricht.
+void handleDbgBlackbox(AsyncWebServerRequest* req) {
+    uint8_t sel = sixback::BB_SEL_ALL;
+    if (const auto* p = req->getParam("ring")) {
+        const String& r = p->value();
+        if      (r == "live")   sel = sixback::BB_SEL_LIVE;
+        else if (r == "snap")   sel = sixback::BB_SEL_SNAP;
+        else if (r == "frozen") sel = sixback::BB_SEL_FROZEN;
+    }
+    uint16_t from = 0, count = 0xFFFF;
+    if (const auto* p = req->getParam("from"))  from  = (uint16_t)p->value().toInt();
+    if (const auto* p = req->getParam("count")) count = (uint16_t)p->value().toInt();
+
+    auto st = std::make_shared<sixback::BlackboxDump>(sel, from, count);
+    req->send(req->beginChunkedResponse("application/json",
+        [st](uint8_t* buf, size_t maxLen, size_t) -> size_t {
+            bool more = false;
+            const size_t n = sixback::blackboxDumpFill(*st, buf, maxLen, more);
+            if (n == 0 && more) return RESPONSE_TRY_AGAIN;   // Puffer zu klein, gleich nochmal
+            return n;                                        // 0 = fertig
+        }));
+}
+
+// POST /api/dbg/blackbox/ack — Freeze-Snapshot als abgeholt markieren und den
+// Platz fuer den naechsten freigeben. BEWUSST getrennt vom Lesen: die alte
+// Fassung setzte das Flag beim Serialisieren, also auch bei einer Antwort, die
+// den Client nie erreicht hat. Quittiert wird jetzt, wenn die Daten
+// nachweislich angekommen sind.
+void handleDbgBlackboxAck(AsyncWebServerRequest* req) {
+    const bool ok = sixback::blackboxAckSnapshot();
+    req->send(ok ? 200 : 404, "application/json",
+              ok ? "{\"harvested\":true}" : "{\"error\":\"no snapshot\"}");
+}
+
 void registerApiEndpoints(AsyncWebServer& ui) {
     // Statische Assets aus LittleFS (CSS, JS, etc.)
     ui.serveStatic("/assets/", LittleFS, "/assets/").setCacheControl("max-age=600");
 
     ui.on("/",                        HTTP_GET,    handleRoot);
     ui.on("/api/status",              HTTP_GET,    handleStatus);
+    ui.on("/api/dbg/blackbox",        HTTP_GET,    handleDbgBlackbox);
+    ui.on("/api/dbg/blackbox/ack",    HTTP_POST,   handleDbgBlackboxAck);
 #if SIXBACK_CONTIG_PROBE
     ui.on("/api/dbg/contig",          HTTP_GET,    handleDbgContig);
 #endif

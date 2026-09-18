@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "ota_pull.h"
+#include "mono_clock.h"
 
 #ifdef SIXBACK_OTA_ENABLED
 
@@ -290,9 +291,16 @@ bool pullAndFlashOne_(const char* path, int updateType,
     }
 
     uint32_t written = 0;
-    uint32_t lastReport = millis();
-    uint32_t lastDataMs = millis();
-    const uint32_t phaseStartMs = millis();
+    // Alle drei Fristen dieser Schleife rechnen ueber sprungbereinigte
+    // Schritte statt ueber (jetzt - startzeitpunkt) — siehe mono_clock.h.
+    // Ein Vorwaertssprung der Zeitbasis hat hier zwei Schadwirkungen, nicht
+    // nur eine: er laesst den Wall-Clock-Backstop grundlos feuern (Vorfall
+    // 2026-08-06: "exceeded 9 min" nach 26 s), UND er laesst den Idle-EOF
+    // unten einen halb geladenen Stream als vollstaendig durchgehen.
+    MonoClock mono(millis());
+    uint32_t elapsedMs   = 0;   // seit Phasenbeginn
+    uint32_t idleMs      = 0;   // seit dem letzten empfangenen Byte
+    uint32_t sinceReport = 0;   // seit dem letzten Fortschritts-Update
     // Read until connection closes OR no new bytes for kIdleTimeoutMs (idle-EOF).
     // Pre-Release-fix: NICHT auf written>=total brechen — total ist
     // (auf ESP HTTPS) unzuverlaessig.
@@ -306,7 +314,7 @@ bool pullAndFlashOne_(const char* path, int updateType,
     // 2026-06-10 (FHEM #52 betateilchen, "seit 10 Minuten so"): der Idle-Timeout
     // oben faengt nur ein TOTAL stehengebliebenes Read ab. Ein pathologisch
     // langsamer-aber-lebendiger Link (oder ein half-open TCP, das connected()==true
-    // haelt und gerade genug troepfelt um lastDataMs immer wieder zu resetten) kann
+    // haelt und gerade genug troepfelt um idleMs immer wieder zu resetten) kann
     // sonst BELIEBIG lange laufen, ohne dass je ein Fehler gesetzt wird. Wall-Clock-
     // Backstop: bei Ueberschreitung sauber abbrechen — Update.abort erhaelt die
     // Anti-Brick-Garantie (laufender Slot bleibt aktiv).
@@ -323,36 +331,34 @@ bool pullAndFlashOne_(const char* path, int updateType,
         : (20UL * 60UL * 1000UL);
     if (kPhaseMaxMs < 5UL * 60UL * 1000UL) kPhaseMaxMs = 5UL * 60UL * 1000UL;
     while (http.connected()) {
-        const uint32_t nowMs     = millis();
-        const uint32_t elapsedMs = nowMs - phaseStartMs;
+        const uint32_t stepMs = mono.step(millis());
+        elapsedMs   += stepMs;
+        idleMs      += stepMs;
+        sinceReport += stepMs;
         if (elapsedMs > kPhaseMaxMs) {
             free(buf);
             // 2026-08-06 (Lab, C6 auf dem Weg nach v0.8.41): dieser Guard hat bei
             // VOLLEM Tempo (~35 KB/s, >10x ueber den unterstellten 3 KB/s) nach
-            // ~26 s gefeuert und dabei "exceeded 9 min" gemeldet — Meldung und
-            // echte Laufzeit sind unvereinbar, die Ursache ist OFFEN (die
-            // uint32-Differenz ist wrap-sicher, ein millis()-Ueberlauf erklaert es
-            // nicht; ein Retry lief unter gleichen Bedingungen glatt durch).
-            // Solange das ungeklaert ist, tragen wir die ROHEN Zaehler in der
-            // Meldung mit: elapsed/budget/start/now zeigen beim naechsten Vorfall
-            // sofort, ob wirklich Zeit vergangen ist oder der Vergleich luegt —
-            // und zwar auch im Feld, wo niemand einen Serial-Mitschnitt hat.
-            // setError_ loggt die Meldung ohnehin auf Serial, ein zweiter Print
-            // waere Dopplung.
+            // ~26 s gefeuert und dabei "exceeded 9 min" gemeldet. Damals blieb die
+            // Ursache offen; der C6-Mitschnitt vom 2026-08-20 hat inzwischen
+            // gezeigt, dass die Zeitbasis dieses Chips im Betrieb springt — was
+            // Groessenordnung und Phaenotyp erklaeren wuerde, fuer JENEN Vorfall
+            // aber nicht bewiesen ist. elapsedMs summiert deshalb jetzt nur noch
+            // plausible Schritte; jumps zaehlt, wie viele verworfen wurden. Feuert
+            // der Guard trotzdem, war der Link wirklich zu langsam.
             setError_(String(phaseName) + ": phase exceeded " +
                       String(kPhaseMaxMs / 60000UL) +
                       " min wall-clock at " + String(written) + "/" +
                       String(contentLen) + " B — aborting (link too slow / stalled)" +
                       " [elapsed=" + String(elapsedMs) + "ms budget=" +
-                      String(kPhaseMaxMs) + "ms start=" + String(phaseStartMs) +
-                      " now=" + String(nowMs) + "]");
+                      String(kPhaseMaxMs) + "ms jumps=" + String(mono.jumps()) + "]");
             Update.abort();
             http.end();
             return false;
         }
         size_t avail = stream->available();
         if (avail == 0) {
-            if (millis() - lastDataMs > kIdleTimeoutMs) {
+            if (idleMs > kIdleTimeoutMs) {
                 Serial.printf("[ota-pull] phase %d idle >%lus — assume EOF at %u bytes\n",
                               phaseIdx, (unsigned long)(kIdleTimeoutMs / 1000),
                               (unsigned)written);
@@ -371,12 +377,12 @@ bool pullAndFlashOne_(const char* path, int updateType,
             return false;
         }
         written += got;
-        lastDataMs = millis();
-        if (millis() - lastReport > 500) {
+        idleMs = 0;
+        if (sinceReport > 500) {
             lock_();
             g_status.progress = written;
             unlock_();
-            lastReport = millis();
+            sinceReport = 0;
         }
         if ((written & 0x3FFF) == 0) delay(1);
     }

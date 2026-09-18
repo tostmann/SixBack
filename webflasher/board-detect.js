@@ -113,7 +113,34 @@
         await loader.main();
 
         const chip  = loader.chip.CHIP_NAME;
-        const flash = await loader.detectFlashSize();
+
+        // esptool-js hat für die neuere RISC-V-Familie die falsche SPI-Register-
+        // basis: C6 und H2 stehen dort auf 0x60002000 (dem C3-Wert), und der C5
+        // erbt ihn mangels eigener Angabe. esptool-py setzt für C5/C6/C61/H2
+        // dagegen 0x60003000. Folge ohne diese Korrektur: alle SPI-Kommandos
+        // laufen auf den falschen Controller, readFlashId() liefert 0, und
+        // detectFlashSize() fällt still auf "4MB" zurück — ein 16-MB-C5 bekäme
+        // das 4-MB-Image als passend markiert. Betrifft esptool-js 0.6.0 und
+        // 0.6.1 gleichermaßen; ein Versions-Bump behebt es nicht.
+        //
+        // Am Blech verifiziert (2026-08-17), jeweils gegen esptool-py am selben
+        // Board: C5 N16R8 mit 0x60002000 -> flash_id 0x000000, mit 0x60003000 ->
+        // 0x184046 = 16MB; C6FH4 -> 0x164020 = 4MB; H2 -> 0x1640c8 = 4MB. C61
+        // ist aus esptool-py übernommen, mangels Board nicht gegengeprüft.
+        // C3/C2/S3/S2/ESP32 bleiben unangetastet — dort stimmt die Basis der Lib.
+        const SPI_BASE_60003000 = ['ESP32-C5', 'ESP32-C6', 'ESP32-C61', 'ESP32-H2'];
+        if (SPI_BASE_60003000.includes(chip) && loader.chip.SPI_REG_BASE === 0x60002000) {
+          loader.chip.SPI_REG_BASE = 0x60003000;
+        }
+
+        // Roh lesen statt detectFlashSize() zu glauben: die Lib gibt bei einem
+        // Kapazitätsbyte, das sie nicht kennt, still "4MB" zurück — nicht von
+        // einem echten 4-MB-Fund unterscheidbar, und ihre Warnung landet im
+        // stummen Terminal oben. Was nicht gelesen werden konnte, soll hier
+        // auch nicht als Messwert auftreten.
+        const flashId  = await loader.readFlashId();
+        const capacity = (flashId >> 16) & 0xff;
+        const flash    = loader.DETECTED_FLASH_SIZES[capacity];
         // PSRAM: the S3 target implements getPsramCap (eFuse-backed). The C5
         // has the same information in its eFuses — PSRAM_CAP, bits 21:19 of
         // EFUSE_RD_MAC_SYS2_REG (= EFUSE_BASE + 0x4C, ESP-IDF efuse_reg.h) —
@@ -141,8 +168,10 @@
         }
 
         if (!mib(flash)) {
-          out.innerHTML = `Detected: <b>${chip}</b>, but the flash size could not be read`
-            + ` (reported “${flash}”). Please pick the image by hand.`;
+          const id = '0x' + (flashId >>> 0).toString(16).padStart(6, '0');
+          out.innerHTML = `Detected: <b>${chip}</b>, but its flash chip did not answer`
+            + ` (flash id ${id}). No image is marked — please pick one by hand, and`
+            + ` tell us the id above if you are unsure which fits.`;
         } else {
           await evaluate({ chip, flash, flashMib: mib(flash), psram });
         }

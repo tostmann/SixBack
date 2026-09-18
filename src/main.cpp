@@ -29,6 +29,7 @@
 #include "preset_store.h"
 #include "ip_failsafe.h"
 #include "system_health.h"
+#include "systimer_blackbox.h"
 #include "auto_mode.h"
 #include "nvs_helper.h"
 #include "tunein_resolver.h"
@@ -161,6 +162,7 @@ void setup() {
     startBoseServer();
     startUiServer();
     sixback::healthInit();        // Crash-Counter, Task-WDT, WiFi-/Heap-Watchdog
+    sixback::blackboxInit();      // SYSTIMER-Blackbox (nur c6, sonst No-Op)
     sixback::startAutoModeTask(); // No-op wenn NVS-Flag auto-mode disabled
     sixback::startMargeKeepAlive(); // 5min-Ping an /setMargeAccount damit
                                     // scmudc-Event-Stream nicht stehen bleibt

@@ -39,6 +39,12 @@ void healthTick();
 // Fuer /api/status — fuegt "health"-Object an doc[key] ein.
 void healthToJson(JsonObject out);
 
+// Sprungbereinigte Uptime in Sekunden. Auf Boards, deren Zeitbasis springt
+// (ESP32-C6 rev v0.0, siehe mono_clock.h), ist das der einzige Uptime-Wert,
+// der nicht rueckwaerts laufen kann — millis()/1000 tut das dort sichtbar.
+// Im Sprungfall untertreibt der Wert lieber, als zurueckzuspringen.
+uint32_t monoUptimeS();
+
 // Reset-Reason vom letzten Boot als kurzer Text ("POWERON","PANIC","WDT",...)
 const char* lastResetReasonStr();
 

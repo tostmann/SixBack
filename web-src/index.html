@@ -464,7 +464,7 @@
     <button class="sb-tab active" data-tab="radio"   onclick="sidebarSelectTab('radio')">📻 Radio</button>
     <button class="sb-tab"        data-tab="stream"  onclick="sidebarSelectTab('stream')">🔗 Stream</button>
     <button class="sb-tab"        data-tab="dlna"    onclick="sidebarSelectTab('dlna')">💿 DLNA</button>
-    <button class="sb-tab"        data-tab="spotify" onclick="sidebarSelectTab('spotify')">🎵 Spotify</button>
+    <button class="sb-tab"        data-tab="spotify" id="sb-tab-spotify" onclick="sidebarSelectTab('spotify')">🎵 Spotify</button>
   </div>
   <!-- Preview-target bar: applies to all tabs. A single click on any tile
        previews that source on the chosen target without writing a preset. -->
@@ -976,7 +976,11 @@ let STATE = { speakers: [], editing: null, dragSource: null, _lastDragEndedAt: 0
                // Devices whose ESP-store has been edited but not yet pushed to hardware.
                // Set on swap/library-drop, cleared on successful push-all.
                // Page reload resets (assumed clean) — this is intentional, see UX docs.
-               dirtySpeakers: new Set() };
+               dirtySpeakers: new Set(),
+               // Spotify-Capability (Issue #43). Default true = Verhalten wie
+               // bisher, solange die Firmware kein features.spotify meldet.
+               // Erst ein explizites false blendet Tab + Poller ab.
+               spotifyAvailable: true, spotifyInit: false, spotifyTimers: [] };
 
 // Station library proxy bases. Tried in order until one returns 200.
 // Default is the canonical public domain (sixback.io -> Apache reverse-proxy).
@@ -1109,6 +1113,9 @@ async function loadStatus() {
     const s = await api('/api/status');
     STATE.myBase = (s.cloud_replacement && s.cloud_replacement.base_url) || '';
     STATE.installedVersion = s.version;
+    // Issue #43: fehlendes features.spotify = Firmware aelter als der Fix
+    // -> wie bisher behandeln (vorhanden). Nur explizites false blendet aus.
+    applySpotifyAvailability(!(s.features && s.features.spotify === false));
     document.getElementById('status-meta').textContent =
       `v${s.version} · ${s.wifi.ip} · RSSI ${s.wifi.rssi} dBm · ${s.chip.model}${s.chip.flash_size ? ' ' + Math.round(s.chip.flash_size/1048576) + 'MB' : ''} · Heap ${Math.round(s.heap.free/1024)}KB · ${s.speakers_count} speaker(s) known`;
     document.getElementById('raw-status').textContent = JSON.stringify(s, null, 2);
@@ -3571,6 +3578,10 @@ function toggleSidebar() {
 }
 
 function sidebarSelectTab(name) {
+  // Issue #43: auf Targets ohne Spotify gibt es den Tab nicht. Der Button ist
+  // ausgeblendet, aber der Aufruf kann auch programmatisch kommen — dann darf
+  // das leere Panel nicht doch aktiviert werden.
+  if (name === 'spotify' && STATE.spotifyAvailable === false) name = 'radio';
   for (const t of document.querySelectorAll('.sb-tab')) {
     t.classList.toggle('active', t.dataset.tab === name);
   }
@@ -5594,6 +5605,7 @@ STATE.spotifyAuth    = null;
 STATE.spotifyLibrary = [];
 
 async function loadSpotifyAuth() {
+  if (STATE.spotifyAvailable === false) return;   // Target ohne Spotify -> kein 404-Traffic
   try {
     const r = await api('/api/spotify/auth');
     STATE.spotifyAuth = r;
@@ -5630,6 +5642,7 @@ function renderSpotifyStatus_() {
 }
 
 async function loadSpotifySlots() {
+  if (STATE.spotifyAvailable === false) return;   // Target ohne Spotify -> kein 404-Traffic
   try {
     const r = await api('/api/spotify/slots');
     STATE.spotifySlots = {};
@@ -5696,6 +5709,7 @@ async function unbindSpotifySlot(devId, slot, bindState) {
 // ---- Spotify-Library (Sidebar-Tile-Storage, D&D-Source) ---------------
 
 async function loadSpotifyLibrary() {
+  if (STATE.spotifyAvailable === false) return;   // Target ohne Spotify -> kein 404-Traffic
   try {
     const r = await api('/api/spotify/library');
     STATE.spotifyLibrary = r.items || [];
@@ -5894,6 +5908,7 @@ async function applySpotifyDrop(payload, dst) {
 
 // Persistente App-Creds: einmal speichern, dann nur noch "Connect"-Klick.
 async function loadSpotifyAppCreds() {
+  if (STATE.spotifyAvailable === false) return;   // Target ohne Spotify -> kein 404-Traffic
   try {
     const r = await api('/api/spotify/app-creds');
     const el  = document.getElementById('spot-appcreds-status');
@@ -5963,6 +5978,7 @@ async function spotifyConnectStored() {
 }
 
 async function loadSpotifyTriggers() {
+  if (STATE.spotifyAvailable === false) return;   // Target ohne Spotify -> kein 404-Traffic
   try {
     const r = await api('/api/spotify/last-trigger');
     const trigs = (r.triggers || []).slice().reverse();   // neueste oben
@@ -6128,13 +6144,39 @@ setInterval(loadStatus, 10000);
 // das die UI sofort wieder an.
 setTimeout(pollOnline, 1500);
 // Spotify status — load once + refresh every 60s to show fresh expiry.
-loadSpotifyAuth();
-loadSpotifyAppCreds();
-loadSpotifySlots();
-loadSpotifyTriggers();
-loadSpotifyLibrary();
-setInterval(loadSpotifyAuth, 60000);
-setInterval(loadSpotifyTriggers, 5000);   // alle 5s damit User schnell sieht ob trigger angekommen
+// Issue #43: NICHT mehr unbedingt. Auf Targets ohne SIXBACK_SPOTIFY_ENABLED
+// (env:esp32) existieren die Routes nicht; der alte Bootstrap erzeugte fuenf
+// 404s beim Laden plus einen 404-Poller alle 5 s, dauerhaft, pro offenem Tab.
+// Der Start haengt jetzt an loadStatus() -> applySpotifyAvailability().
+function initSpotifyUi() {
+  if (STATE.spotifyInit) return;
+  STATE.spotifyInit = true;
+  loadSpotifyAuth();
+  loadSpotifyAppCreds();
+  loadSpotifySlots();
+  loadSpotifyTriggers();
+  loadSpotifyLibrary();
+  STATE.spotifyTimers.push(setInterval(loadSpotifyAuth, 60000));
+  STATE.spotifyTimers.push(setInterval(loadSpotifyTriggers, 5000));   // schnelle Trigger-Sicht
+}
+
+// Schaltet die Spotify-UI scharf oder blendet sie aus. Wird bei jedem
+// loadStatus()-Tick aufgerufen und ist idempotent.
+function applySpotifyAvailability(ok) {
+  STATE.spotifyAvailable = ok;
+  const tab = document.getElementById('sb-tab-spotify');
+  const pane = document.getElementById('sb-panel-spotify');
+  if (tab)  tab.style.display  = ok ? '' : 'none';
+  if (!ok) {
+    for (const id of STATE.spotifyTimers) clearInterval(id);
+    STATE.spotifyTimers = [];
+    // War der Tab aktiv (z.B. FS neuer als Firmware), zurueck auf Radio.
+    if (STATE.sidebarTab === 'spotify') sidebarSelectTab('radio');
+    else if (pane) pane.classList.remove('active');
+    return;
+  }
+  initSpotifyUi();
+}
 </script>
 
 <!-- Progress modal — used by 🔄 Status and push-all flows. The backdrop is

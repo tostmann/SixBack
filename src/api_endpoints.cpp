@@ -3758,28 +3758,124 @@ void handleRoot(AsyncWebServerRequest* req) {
         req->send(LittleFS, "/index.html", "text/html");
         return;
     }
-    String ip = WiFi.localIP().toString();
+    // --- Fallback: kein index.html(.gz) im LittleFS --------------------------
+    // Zwei Ursachen, die der Nutzer nicht unterscheiden kann:
+    //   (a) frisch geflashte Firmware ohne `uploadfs` (Dev-Fall), oder
+    //   (b) ein Online-Update ist in Phase 1 (littlefs) abgebrochen. Die
+    //       FS-Partition wird IN PLACE beschrieben (kein A/B fuers FS), ein
+    //       Abbruch laesst sie halb beschrieben zurueck -> kein index.html.gz.
+    // (b) ist der Fall, der im Feld auftrat und auf Testhardware reproduziert
+    // wurde:
+    // Firmware, NVS, Speaker und Presets sind unberuehrt, aber ohne UI ist der
+    // Web-Flasher die einzige sichtbare Option — und dort liegt "Install"
+    // (= Erase: WLAN-Creds und alle Presets weg) einen Klick neben "Update
+    // existing". Diese Seite muss deshalb drei Dinge liefern: die Entwarnung,
+    // einen Knopf der den Pull direkt nochmal startet, und die Warnung vor dem
+    // Erase. Kein LittleFS noetig — alles inline.
+#if defined(SIXBACK_OTA_ENABLED) && !defined(SIXBACK_OTA_SELFUPDATE_UNSUPPORTED)
+    constexpr bool kSelfUpdate = true;
+    const auto otaSt = sixback::ota::getStatus();
+    const bool interrupted = (otaSt.state == sixback::ota::State::ERROR_);
+    String otaErr = otaSt.error;
+    otaErr.replace("&", "&amp;");
+    otaErr.replace("<", "&lt;");
+#else
+    constexpr bool kSelfUpdate = false;
+    const bool interrupted = false;
+    String otaErr;
+#endif
+
     String html =
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<title>SixBack " FW_VERSION_STRING "</title>"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<style>body{font-family:-apple-system,Segoe UI,sans-serif;max-width:40em;margin:3em auto;padding:0 1em}"
-        "code{background:#fee;padding:.1em .3em;border-radius:3px}</style></head><body>"
-        "<h1>SixBack</h1><p>Web UI not flashed. Use the JSON API directly:</p>"
-        "<ul>"
-          "<li><code>GET /api/status</code></li>"
-          "<li><code>GET /api/speakers</code></li>"
-          "<li><code>POST /api/speakers/discover</code></li>"
-          "<li><code>POST /api/speaker/&lt;id&gt;/migrate</code></li>"
-          "<li><code>GET/PUT /api/speaker/&lt;id&gt;/preset/&lt;1..6&gt;</code></li>"
-          "<li><code>POST /api/group/sync</code></li>"
-          "<li><code>GET /api/tunein/resolve/&lt;s24896&gt;</code></li>"
-          "<li><code>POST /api/ota</code> (multipart firmware.bin)</li>"
-          "<li><code>POST /api/ota/fs</code> (multipart littlefs.bin)</li>"
-        "</ul>"
-        "<p>Version <code>" FW_VERSION_STRING "</code> &middot; Build " FW_BUILD_DATE
-        " &middot; <a href=\"https://github.com/tostmann/SixBack\">github.com/tostmann/SixBack</a></p>"
-        "</body></html>";
+        "<style>body{font-family:-apple-system,Segoe UI,sans-serif;max-width:40em;margin:3em auto;padding:0 1em;line-height:1.5}"
+        "code{background:#eee;padding:.1em .3em;border-radius:3px}"
+        "button{font-size:1.05em;padding:.55em 1.1em;border-radius:6px;border:1px solid #9a4b00;"
+        "background:#c96a12;color:#fff;cursor:pointer}button:disabled{opacity:.5;cursor:default}"
+        ".ok{color:#1d6b2f}.warn{color:#9a4b00}.hint{color:#666;font-size:.92em}"
+        "details{margin-top:2em}</style></head><body>"
+        "<h1>SixBack</h1>"
+        "<p><b>The web interface is not installed on this device.</b></p>";
+
+    if (interrupted) {
+        html += "<p class=\"warn\">The last online update was interrupted: <code>";
+        html += otaErr;
+        html += "</code></p>";
+    }
+
+    // Die Entwarnung ist der wichtigste Satz der Seite: sie verhindert den
+    // Reflex "kaputt -> Werkszustand". Belegt (Lab 2026-09-20): nach dem
+    // Abbruch meldete /api/status unveraendert 3 Speaker und preset_store
+    // load_ok mit 3 Eintraegen — das FS-Image beruehrt NVS nicht.
+    html += "<p class=\"ok\"><b>Your speakers and presets are not affected.</b> "
+            "SixBack is still running and keeps serving them \xE2\x80\x94 only the files for "
+            "this page are missing.</p>";
+
+    if (kSelfUpdate) {
+        html += "<p><button id=\"r\">Reinstall web interface</button></p>"
+                "<p id=\"s\"></p>"
+                "<p class=\"hint\">Downloads the web interface and firmware from "
+                "sixback.io again and reboots. Your settings are kept.</p>";
+    } else {
+        html += "<p>Reinstall it with <code>POST /api/ota/fs</code> (multipart "
+                "<code>littlefs.bin</code>), or open the web flasher at "
+                "<a href=\"https://sixback.io/\">sixback.io</a> and choose "
+                "<b>Update existing</b>.</p>";
+    }
+
+    html += "<p class=\"warn\">Do <b>not</b> pick <b>Install</b> / erase in the web "
+            "flasher unless you want a factory reset \xE2\x80\x94 that wipes the Wi-Fi "
+            "credentials and every stored preset.</p>"
+            "<details><summary>JSON API</summary><ul>"
+              "<li><code>GET /api/status</code></li>"
+              "<li><code>GET /api/speakers</code></li>"
+              "<li><code>POST /api/speakers/discover</code></li>"
+              "<li><code>POST /api/speaker/&lt;id&gt;/migrate</code></li>"
+              "<li><code>GET/PUT /api/speaker/&lt;id&gt;/preset/&lt;1..6&gt;</code></li>"
+              "<li><code>POST /api/group/sync</code></li>"
+              "<li><code>GET /api/tunein/resolve/&lt;s24896&gt;</code></li>"
+              "<li><code>POST /api/ota</code> (multipart firmware.bin)</li>"
+              "<li><code>POST /api/ota/fs</code> (multipart littlefs.bin)</li>"
+            "</ul></details>"
+            "<p class=\"hint\">Version <code>" FW_VERSION_STRING "</code> &middot; Build "
+            FW_BUILD_DATE " &middot; <a href=\"https://github.com/tostmann/SixBack\">"
+            "github.com/tostmann/SixBack</a></p>";
+
+    if (kSelfUpdate) {
+        // force=1 ist hier Absicht, nicht Bequemlichkeit: bricht ein reines
+        // FS-Update INNERHALB derselben Version ab, ist current == latest, und
+        // installOnlineAsync() lehnt mit "already up-to-date" ab — der Nutzer
+        // waere auf genau der Seite gestrandet, die ihm helfen soll. Der
+        // Reparaturpfad will "hol die Artefakte nochmal", nicht "gibt es was
+        // Neues". installOnlineForceAsync() braucht keinen Manifest-Check
+        // vorweg; die Artefaktnamen stehen fest (chipPrefix_).
+        html += "<script>"
+            "var b=document.getElementById('r'),s=document.getElementById('s'),t=null;"
+            "function poll(){fetch('/api/update/status',{cache:'no-store'})"
+            ".then(function(r){return r.json()}).then(function(d){"
+              "if(d.state==='installing'){b.disabled=true;"
+                "var p=d.total?Math.round(d.progress*100/d.total):0;"
+                "s.textContent='Downloading '+(d.phase==='fs'?'web interface':'firmware')"
+                  "+' \xE2\x80\x94 '+p+'% ('+d.phase_idx+'/'+d.phase_n+')';"
+                "if(!t){t=setInterval(poll,1500)}return}"
+              "if(t){clearInterval(t);t=null}"
+              "if(d.state==='done'){b.disabled=true;"
+                "s.textContent='Done \xE2\x80\x94 rebooting. This page reloads in a moment.';"
+                "setTimeout(function(){location.reload()},15000);return}"
+              "if(d.state==='error'){b.disabled=false;"
+                "s.textContent='Failed: '+(d.error||'unknown error')+' \xE2\x80\x94 you can try again.';return}"
+              "b.disabled=false;s.textContent=''"
+            "}).catch(function(){if(t){clearInterval(t);t=null}b.disabled=false})}"
+            "b.onclick=function(){b.disabled=true;s.textContent='Starting\xE2\x80\xA6';"
+              "fetch('/api/update/install?force=1',{method:'POST',cache:'no-store'})"
+              ".then(function(){poll()})"
+              ".catch(function(e){b.disabled=false;s.textContent='Request failed: '+e})};"
+            "poll();"
+            "</script>";
+    }
+
+    html += "</body></html>";
     req->send(200, "text/html; charset=utf-8", html);
 }
 

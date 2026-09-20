@@ -1567,6 +1567,15 @@ function renderOnline(d) {
       break;
     case 'error':
       msg = '✗ ' + (d.error || 'unknown error');
+      // Ein abgebrochener Pull laesst den bisherigen Slot aktiv (Update.abort im
+      // Backend) — das Geraet laeuft unveraendert weiter. Ohne diesen Satz liest
+      // sich der nackte Fehlerstring wie "Geraet kaputt", und der naechste Griff
+      // geht zum Webflasher = Factory-Flash = NVS-Wipe (beobachteter Feldfall).
+      // Nur zeigen, wenn wirklich ein Update vorlag (latest gesetzt); der
+      // "Online OTA not available"-Fall (C5 ohne PSRAM) hat latest leer.
+      if (d.latest && d.latest !== d.current) {
+        msg += ' — previous firmware is still active, your device is unaffected. Click "Install update" to retry.';
+      }
       cls = 'color:var(--bad)';
       break;
     default:
@@ -1620,7 +1629,13 @@ function renderOnline(d) {
 
   // Button-Enable-State
   checkBtn.disabled = (d.state === 'checking' || d.state === 'installing');
-  instBtn.disabled  = (d.state !== 'available');
+  // Install auch nach einem fehlgeschlagenen Pull anbieten, solange das Manifest
+  // ein Update ausweist: installOnlineAsync() prueft bei state != available
+  // ohnehin synchron nach und startet dann — der Retry scheiterte bisher nur an
+  // diesem UI-Gate. Sonst blieb als einziger aktiver Knopf "Force re-install",
+  // dessen Dialog von "current/older firmware" spricht.
+  const retryable = (d.state === 'error' && !!d.latest && d.latest !== d.current);
+  instBtn.disabled  = !(d.state === 'available' || retryable);
 
   // Polling: nur waehrend installing, Reload nach done.
   if (d.state === 'installing') {
@@ -4885,6 +4900,10 @@ async function downloadSnapshot(devId) {
   prog.querySelector('div').style.width = '0%';
   document.getElementById('snap-ok').disabled = false;
   document.getElementById('snap-cancel').disabled = false;
+  // snapshotSend() disables all three buttons and only re-enables them on
+  // failure; after a successful upload the modal closes with Send still
+  // disabled, so it must be reset here or it stays greyed out until reload.
+  document.getElementById('snap-send').disabled = false;
 
   // Probe meta — sets default + info text
   let info;

@@ -9,11 +9,16 @@
 // genau wie der v0.8.20-UI-Play-Reroute, nur hardware-getriggert.
 //
 // Loop-Guard (gegen Endlos-Re-Select durch unsere EIGENEN /select):
-//   1. Trigger nur bei INVALID_SOURCE, nicht bei jeder Selektion (Erfolg=PLAY_STATE).
+//   1. Trigger nur bei INVALID_SOURCE oder ohne PLAY_STATE binnen 5 s, nicht bei jeder Selektion.
 //   2. Self-Select-Suppress-Fenster: jedes eigene /select (selectStationOnSpeaker,
 //      doPush_) markiert gabboMarkSelfSelect(ip) -> resultierendes
 //      nowSelectionUpdated wird ~20s ignoriert.
 //   3. Per-Slot-Versuchs-Cap (Backstop gegen genuin tote Quelle).
+//
+// Nachfassen: bringt ein Re-Arm binnen kVerifyMs (bei BUFFERING kVerifyBufferingMs) kein
+// PLAY_STATE, folgt ein weiteres /select (bis zum Versuchs-Cap). Abbruch bei anderem Tastendruck
+// (dieselbe Taste erneut laesst es weiterlaufen), bei STANDBY/anderer Quelle, bei WS-Reconnect
+// und wenn inzwischen WebUI/Push selbst selektiert hat.
 //
 // Feature-Gate SIXBACK_GABBO_WATCHER_ENABLED: nur PSRAM-Targets (S3/S3-8MB).
 // Auf esp32/c3/c6 (kein PSRAM, 30KB-Heap-Watchdog) sind die Symbole inline-no-op.

@@ -232,6 +232,12 @@ PresetSource presetSourceFromStr(const String& s);
 String orionStationLocation(const String& streamUrl, const String& name,
                             const String& imageUrl);
 
+// Gegenstueck zu orionStationLocation: zerlegt "/station?data=<base64-json>"
+// (url-safe oder Standard-Alphabet) in streamUrl/name/imageUrl. false, wenn
+// location keine ORION-Form hat oder data nicht dekodierbar ist.
+bool orionStationDecode(const String& location, String& streamUrl,
+                        String& name, String& imageUrl);
+
 // XML-escapt Text fuer ContentItem-Attribute / <itemName> (& < > " '). Public,
 // damit der direkte /select-Push (api_endpoints.cpp) denselben Escaper nutzt
 // wie toBoseXml — sonst verstuemmelt ein '&' im Namen das ContentItem-XML und

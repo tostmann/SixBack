@@ -819,6 +819,29 @@ String orionStationLocation(const String& streamUrl, const String& name,
     return String("/station?data=") + b64;
 }
 
+bool orionStationDecode(const String& location, String& streamUrl,
+                        String& name, String& imageUrl) {
+    static const char kPrefix[] = "/station?data=";
+    if (!location.startsWith(kPrefix)) return false;
+    String data = location.substring(sizeof(kPrefix) - 1);
+    int amp = data.indexOf('&');                 // weitere Query-Parameter abschneiden
+    if (amp >= 0) data = data.substring(0, amp);
+    data.replace('-', '+'); data.replace('_', '/');   // url-safe -> std (wie handleOrionStation)
+    if (data.length() == 0) return false;
+    size_t outLen = 0;
+    std::vector<unsigned char> buf(((data.length() / 4) + 1) * 3 + 8);
+    if (mbedtls_base64_decode(buf.data(), buf.size(), &outLen,
+            (const unsigned char*)data.c_str(), data.length()) != 0 || outLen == 0) {
+        return false;
+    }
+    JsonDocument d;
+    if (deserializeJson(d, buf.data(), outLen)) return false;
+    streamUrl = (const char*)(d["streamUrl"] | "");
+    name      = (const char*)(d["name"]      | "");
+    imageUrl  = (const char*)(d["imageUrl"]  | "");
+    return streamUrl.length() > 0;
+}
+
 String PresetStore::toBoseXml(const String& deviceId) {
     LockGuard g(*this);
     // Format aus Pre-Migration-Snapshot der Bose Cloud:

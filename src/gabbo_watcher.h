@@ -20,6 +20,12 @@
 // (dieselbe Taste erneut laesst es weiterlaufen), bei STANDBY/anderer Quelle, bei WS-Reconnect
 // und wenn inzwischen WebUI/Push selbst selektiert hat.
 //
+// Mid-Stream-Rescue: bricht ein LIR-Stream, der schon >=20 s spielte, mit INVALID_SOURCE ab
+// (beobachtet: die Box registriert Presets/Quellen neu und verliert dabei den Stream), selektiert
+// der Watcher nach dem Ausklingen des Bursts dieselbe Station erneut (+1 Nachfassen, Cap je 30 min).
+// Nie nach STANDBY/Stop/Pause/anderer Quelle/anderer Senderwahl und nie in einer Multiroom-Zone;
+// nach jedem WS-Reconnect wird der Stand per BMX /now_playing neu erhoben statt weitergetragen.
+//
 // Feature-Gate SIXBACK_GABBO_WATCHER_ENABLED: nur PSRAM-Targets (S3/S3-8MB).
 // Auf esp32/c3/c6 (kein PSRAM, 30KB-Heap-Watchdog) sind die Symbole inline-no-op.
 

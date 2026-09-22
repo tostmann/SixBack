@@ -10,6 +10,7 @@
 #include "config.h"
 
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <map>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -35,6 +36,21 @@ constexpr uint32_t kVerifyMs          = 10000;   // nach Re-Arm: so lange auf PL
 constexpr uint32_t kVerifyBufferingMs = 20000;   // Frist ab Re-Arm, sobald die Box BUFFERING meldet (sie arbeitet)
 constexpr uint32_t kPingMs            = 30000;   // periodischer WS-Ping (Liveness)
 constexpr uint32_t kIdleMs            = 90000;   // kein Frame so lange -> Socket tot -> reconnect
+
+// Mid-Stream-Rescue (2026-09-22, Test auf SoundTouch 10 / FW 27.0.6): mitten in einem laufenden
+// LIR-Stream registriert die Box gelegentlich ihre Presets/Quellen neu (Flut von sourcesUpdated,
+// Presetliste kurz leer) und meldet danach nowPlaying INVALID_SOURCE — der Stream ist weg, die Box
+// bleibt stumm. Beobachtet im Feld und auf Testhardware, Ausloeser unbekannt. Ein erneutes /select
+// derselben Station holt den Stream zurueck. Nur wenn die Box vorher auf LIR spielte und dazwischen
+// weder Taste noch STANDBY/andere Quelle kam: derselbe Burst trifft auch Boxen im Standby.
+constexpr uint32_t kRescueMinPlayMs    = 20000;    // so lange muss LIR vorher gespielt haben (Kaltstart = Re-Arm)
+constexpr uint32_t kRescueDelayMs      = 6000;     // nach INVALID_SOURCE: Burst ausklingen lassen
+constexpr uint32_t kRescueQuietMs      = 3000;     // weitere Burst-Frames schieben die Frist so weit hinaus ...
+constexpr uint32_t kRescueMaxDelayMs   = 20000;    // ... aber hoechstens bis hierhin nach INVALID_SOURCE
+constexpr uint32_t kRescueVerifyMs     = 20000;    // nach Rescue-/select: so lange auf PLAY_STATE warten
+constexpr uint8_t  kRescueMaxAttempts  = 2;        // je Abbruch: Rescue + ein Nachfassen
+constexpr uint8_t  kRescueMaxPerWindow = 4;        // Backstop gegen genuin tote Station ...
+constexpr uint32_t kRescueWindowMs     = 1800000;  // ... je 30 min
 
 // v0.8.24 #15-Hotfix: Bisher hielt der Watcher PRO Speaker eine persistente gabbo-TCP-
 // Socket offen. Bei Grossinstallationen (~10 Boxen) erschoepfen 9-10 Dauer-Sockets das
@@ -90,6 +106,20 @@ struct Conn {
     uint32_t       lastPingMs = 0;            // letzter gesendeter WS-Ping
     uint8_t        attempts[7]   = {0,0,0,0,0,0,0};   // [slot] Versuchs-Cap
     uint32_t       attemptWin[7] = {0,0,0,0,0,0,0};
+    // Mid-Stream-Rescue
+    bool           lirPlaying = false;        // letzter bekannter Stand: LIR in PLAY_STATE
+    uint32_t       lirSinceMs = 0;            // seit wann dieser Stream spielt
+    String         lirLoc;                    // ContentItem-location des laufenden LIR-Streams
+    String         lirName;                   // itemName dazu (XML-escaped wie im Frame)
+    uint8_t        rescueStage = 0;           // 0 aus · 1 Abbruch erkannt, wartet · 2 /select gesendet, wartet auf PLAY_STATE
+    uint32_t       rescueDropMs = 0;          // Zeitpunkt des INVALID_SOURCE
+    uint32_t       rescueDue = 0;             // naechster Schritt (senden bzw. nachfassen)
+    uint32_t       rescueSelMark = 0;         // g_suppress-Marke zum Vergleich (Fremd-Select-Erkennung)
+    uint8_t        rescueAttempts = 0;        // /select je Abbruch
+    uint8_t        rescueWinCount = 0;        // /select im laufenden Fenster
+    uint32_t       rescueWinStart = 0;
+    String         rescueUrl;                 // Stream-URL, die der Rescue gerade zurueckholt
+    bool           seedPending = false;       // nach Connect: erst gepufferte Frames, dann /now_playing
 };
 std::map<String, Conn> g_conns;   // deviceId -> Conn (Knoten stabil, kein realloc-copy)
 
@@ -122,6 +152,115 @@ bool hasLirPreset_(const String& deviceId) {
     for (const auto& p : PresetStore::instance().getForSpeaker(deviceId))
         if (p.source == PresetSource::LOCAL_INTERNET_RADIO) return true;
     return false;
+}
+
+// location-Attribut des ersten ContentItem ab Position from (from < 0 -> ""), sonst "".
+String contentItemLocation_(const String& f, int from) {
+    if (from < 0) return String();
+    int p = f.indexOf("<ContentItem ", from);
+    if (p < 0) return String();
+    int e = f.indexOf('>', p);
+    int q = f.indexOf("location=\"", p);
+    if (q < 0 || (e >= 0 && q > e)) return String();
+    q += 10;
+    int end = f.indexOf('"', q);
+    return (end > q) ? f.substring(q, end) : String();
+}
+
+String nowPlayingLocation_(const String& f) { return contentItemLocation_(f, f.indexOf("<nowPlaying ")); }
+String selectionLocation_(const String& f)  { return contentItemLocation_(f, f.indexOf("<preset ")); }
+
+// nowPlaying -> <itemName> des ContentItem, sonst "".
+String nowPlayingItemName_(const String& f) {
+    int ci = f.indexOf("<ContentItem ", f.indexOf("<nowPlaying "));
+    if (ci < 0) return String();
+    int p = f.indexOf("<itemName>", ci);
+    if (p < 0) return String();
+    p += 10;
+    int e = f.indexOf("</itemName>", p);
+    return (e > p) ? f.substring(p, e) : String();
+}
+
+// Stream-URL hinter einer ContentItem-location: ORION-Envelope dekodiert, sonst die Roh-URL.
+// Vergleichsbasis fuer "dieselbe Station" — unser eigenes /select-Echo traegt die ORION-Form,
+// ein Tastendruck die im Preset gespeicherte Roh-URL.
+String streamUrlOf_(const String& location) {
+    String u, n, i;
+    if (orionStationDecode(location, u, n, i)) return u;
+    return unescapeXml(location);
+}
+
+// true = Box steckt in einer Multiroom-Zone (Master oder Mitglied). Was ein /select dort mit
+// der Zone macht, ist ungemessen -> der Rescue haelt sich raus.
+bool inZone_(const String& ip) {
+    HTTPClient http;
+    http.setReuse(false);
+    http.setConnectTimeout(1500);
+    http.setTimeout(2500);
+    if (!http.begin("http://" + ip + ":" + String(BOSE_BMX_PORT) + "/getZone")) return false;
+    bool zone = false;
+    if (http.GET() == 200) zone = http.getString().indexOf("<member") >= 0;
+    http.end();
+    return zone;
+}
+
+void cancelRescue_(Conn& c, const char* why) {
+    if (!c.rescueStage) return;
+    Serial.printf("[gabbo] %s rescue cancelled (%s)\n", c.deviceId.c_str(), why);
+    c.rescueStage = 0;
+}
+
+// Frames aus einer Reconnect-Luecke fehlen (z.B. STANDBY) -> Stand verwerfen, nie weitertragen.
+void resetRescue_(Conn& c) {
+    c.lirPlaying  = false;
+    c.rescueStage = 0;
+}
+
+// Haelt fest, ob die Box gerade LIR spielt, und erkennt den Stream-Verlust mitten im Lauf.
+// Quelle: gabbo nowPlayingUpdated oder (nach Connect) BMX /now_playing — gleiches Schema.
+void noteNowPlaying_(Conn& c, const String& f) {
+    String src = nowPlayingSource_(f);
+    if (src.length() == 0) return;
+    uint32_t now = millis();
+    if (src == "LOCAL_INTERNET_RADIO") {
+        if (f.indexOf("STOP_STATE") >= 0 || f.indexOf("PAUSE_STATE") >= 0) {
+            // Nutzer hat angehalten (Play/Pause an der Box, App): nichts retten.
+            c.lirPlaying = false;
+            cancelRescue_(c, "stopped");
+            return;
+        }
+        if (f.indexOf("PLAY_STATE") < 0) return;   // BUFFERING / ohne playStatus: neutral
+        String loc = nowPlayingLocation_(f);
+        // Nach gelungenem Rescue desselben Streams zaehlt die Spielzeit weiter (ein zweiter
+        // Abbruch kurz danach ist wieder rettbar; den Loop begrenzt der Fenster-Cap).
+        if (loc != c.lirLoc || (!c.lirPlaying && c.rescueStage != 2)) c.lirSinceMs = now;
+        c.lirPlaying = true;
+        c.lirLoc     = loc;
+        c.lirName    = nowPlayingItemName_(f);
+        if (c.rescueStage == 2) {
+            Serial.printf("[gabbo] %s rescue OK: PLAY_STATE %lu ms after the drop\n",
+                          c.deviceId.c_str(), (unsigned long)(now - c.rescueDropMs));
+        }
+        c.rescueStage = 0;
+        return;
+    }
+    if (src == "INVALID_SOURCE") {
+        bool armed = c.lirPlaying && (now - c.lirSinceMs) >= kRescueMinPlayMs;
+        c.lirPlaying = false;
+        if (!armed || c.rescueStage != 0) return;
+        if (c.pendingSlot >= 1 || c.verifySlot >= 1) return;   // Kaltstart -> Re-Arm ist zustaendig
+        c.rescueStage    = 1;
+        c.rescueDropMs   = now;
+        c.rescueDue      = now + kRescueDelayMs;
+        c.rescueSelMark  = lastSelfSelectMs_(c.ip);
+        c.rescueAttempts = 0;
+        Serial.printf("[gabbo] %s LIR stream lost after %lus (INVALID_SOURCE) -> rescue pending\n",
+                      c.deviceId.c_str(), (unsigned long)((now - c.lirSinceMs) / 1000));
+        return;
+    }
+    // STANDBY oder andere Quelle: der Nutzer hat aus- bzw. umgeschaltet -> nichts retten.
+    c.lirPlaying = false;
+    cancelRescue_(c, src.c_str());
 }
 
 // followUp=false: erster Re-Arm nach einem Tastendruck. followUp=true: Nachfassen, weil der
@@ -176,9 +315,100 @@ bool reArm_(Conn& c, int slot, bool followUp) {
     return true;
 }
 
+// Mid-Stream-Rescue faellig (Stage 1: Abbruch erkannt; Stage 2: Rescue ohne PLAY_STATE): dieselbe
+// Station erneut per ORION-/select, solange weder WebUI/Push dazwischen selektiert hat noch ein Cap greift.
+void rescueStep_(Conn& c) {
+    if (lastSelfSelectMs_(c.ip) != c.rescueSelMark) {
+        Serial.printf("[gabbo] %s rescue dropped: newer /select by UI/push\n", c.deviceId.c_str());
+        c.rescueStage = 0;
+        return;
+    }
+    if (c.rescueAttempts >= kRescueMaxAttempts) {
+        Serial.printf("[gabbo] %s rescue gave up: no PLAY_STATE after %u attempt(s)\n",
+                      c.deviceId.c_str(), c.rescueAttempts);
+        c.rescueStage = 0;
+        return;
+    }
+    uint32_t now = millis();
+    if (now - c.rescueWinStart > kRescueWindowMs) { c.rescueWinStart = now; c.rescueWinCount = 0; }
+    if (c.rescueWinCount >= kRescueMaxPerWindow) {
+        // Zaehlt bewusst auch gelungene Rescues: falls ein Abbruch Folge unseres eigenen /select
+        // waere, bricht nur dieser Cap die Schleife.
+        Serial.printf("[gabbo] %s rescue cap reached (%u rescues in 30 min), pausing until the window resets\n",
+                      c.deviceId.c_str(), c.rescueWinCount);
+        c.rescueStage = 0;
+        return;
+    }
+    Preset p;
+    p.slot   = 0;
+    p.source = PresetSource::LOCAL_INTERNET_RADIO;
+    if (!orionStationDecode(c.lirLoc, p.streamUrl, p.name, p.imageUrl)) {
+        // Roh-URL als location (nicht ueber ORION gestartet): selectStationOnSpeaker verpackt sie.
+        String loc = unescapeXml(c.lirLoc);
+        if (!loc.startsWith("http")) {
+            Serial.printf("[gabbo] %s rescue skipped: no stream URL in location\n", c.deviceId.c_str());
+            c.rescueStage = 0;
+            return;
+        }
+        p.streamUrl = loc;
+    }
+    if (p.name.length() == 0) p.name = unescapeXml(c.lirName);
+    if (c.rescueAttempts == 0 && inZone_(c.ip)) {
+        Serial.printf("[gabbo] %s rescue skipped: speaker is in a multiroom zone\n", c.deviceId.c_str());
+        c.rescueStage = 0;
+        return;
+    }
+    c.rescueUrl = p.streamUrl;
+    c.rescueAttempts++;
+    c.rescueWinCount++;
+    Serial.printf("[gabbo] %s LIR stream lost -> RESCUE via ORION /select (attempt %u)\n",
+                  c.deviceId.c_str(), c.rescueAttempts);
+    uint32_t t0 = millis();
+    int code = selectStationOnSpeaker(c.ip, p);   // markiert gabboMarkSelfSelect(ip) VOR dem POST
+    uint32_t mark = lastSelfSelectMs_(c.ip);
+    Serial.printf("[gabbo] %s rescue /select -> HTTP %d (stack free %u)\n", c.deviceId.c_str(), code,
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    if ((uint32_t)(mark - t0) > 50) {   // waehrend unseres POST hat WebUI/Push selektiert
+        Serial.printf("[gabbo] %s rescue: /select by UI/push during rescue, stop\n", c.deviceId.c_str());
+        c.rescueStage = 0;
+        return;
+    }
+    c.rescueStage   = 2;
+    c.rescueSelMark = mark;
+    c.rescueDue     = millis() + kRescueVerifyMs;
+}
+
+// Nach (Re)Connect den Stand einmal per BMX holen, statt einen alten "spielt LIR"-Stand
+// weiterzutragen: ein Burst auf einer inzwischen ausgeschalteten Box darf sie nicht einschalten.
+void seedFromNowPlaying_(Conn& c) {
+    resetRescue_(c);
+    HTTPClient http;
+    http.setReuse(false);
+    http.setConnectTimeout(1500);
+    http.setTimeout(2500);
+    if (!http.begin("http://" + c.ip + ":" + String(BOSE_BMX_PORT) + "/now_playing")) return;
+    if (http.GET() == 200) {
+        noteNowPlaying_(c, http.getString());
+        if (c.lirPlaying) Serial.printf("[gabbo] %s seeded: LIR playing\n", c.deviceId.c_str());
+    }
+    http.end();
+}
+
 void handleFrame_(Conn& c, const String& f) {
     if (f.indexOf("nowSelectionUpdated") >= 0) {
         int slot = parsePresetId_(f);
+        c.lirPlaying = false;
+        if (c.rescueStage == 2) {
+            // Dieselbe Station: Echo unseres eigenen Rescue-/select oder erneuter Druck auf ihre
+            // Taste (natuerliche Reaktion auf Stille) -> Nachfassen weiterlaufen lassen; ein neuer
+            // Pending liefe ins Suppress-Fenster und bliebe stumm. Andere Station (auch per /select
+            // ohne SixBack, z.B. aus einer Hausautomation) -> abbrechen.
+            String u = streamUrlOf_(selectionLocation_(f));
+            if (u.length() && u == c.rescueUrl) return;
+            cancelRescue_(c, "new selection");
+        } else if (c.rescueStage == 1) {
+            cancelRescue_(c, "new selection");
+        }
         if (slot >= 1) {
             // Nochmal DIESELBE Taste waehrend des Nachfassens (natuerliche Reaktion auf eine
             // haengende Box; auch POWER auf haengender Box meldet den letzten Slot): Rettung
@@ -188,6 +418,16 @@ void handleFrame_(Conn& c, const String& f) {
             c.pendingSlot = slot; c.pendingTs = millis(); c.verifySlot = -1;
         }
         return;
+    }
+    if (f.indexOf("nowPlayingUpdated") >= 0) {
+        noteNowPlaying_(c, f);
+    } else if (c.rescueStage == 1 &&
+               (f.indexOf("<sourcesUpdated") >= 0 || f.indexOf("<presetsUpdated") >= 0)) {
+        // Burst laeuft noch -> Rescue erst, wenn die Box sich beruhigt hat (mit Obergrenze).
+        uint32_t due = millis() + kRescueQuietMs;
+        uint32_t cap = c.rescueDropMs + kRescueMaxDelayMs;
+        if ((int32_t)(due - cap) > 0) due = cap;
+        if ((int32_t)(due - c.rescueDue) > 0) c.rescueDue = due;
     }
     if (f.indexOf("PLAY_STATE") >= 0) { c.pendingSlot = -1; c.verifySlot = -1; return; }   // Erfolg -> nichts tun
     // Box ist auf etwas anderem als unserer LIR-Quelle (STANDBY = Nutzer hat ausgeschaltet,
@@ -250,6 +490,7 @@ void reconcile_() {
             Serial.printf("[gabbo] %s ip %s -> %s (reconnect)\n",
                           it->first.c_str(), it->second.ip.c_str(), d.second.c_str());
             it->second.ws.close();
+            resetRescue_(it->second);
             it->second.ip = d.second;
             it->second.lastConnectTry = 0;
         }
@@ -285,6 +526,7 @@ void watcherTask_(void* /*arg*/) {
                 if (c.ws.connected()) c.ws.close();
                 c.pendingSlot = -1;
                 c.verifySlot = -1;
+                resetRescue_(c);
                 continue;
             }
             if (!c.ws.connected()) {
@@ -294,6 +536,7 @@ void watcherTask_(void* /*arg*/) {
                         c.lastRxMs = millis();
                         c.lastPingMs = millis();
                         Serial.printf("[gabbo] connected %s @ %s\n", c.deviceId.c_str(), c.ip.c_str());
+                        c.seedPending = true;   // erst gepufferte Frames (aelter), dann /now_playing (neuer)
                     } else {
                         Serial.printf("[gabbo] connect failed %s @ %s\n", c.deviceId.c_str(), c.ip.c_str());
                     }
@@ -303,6 +546,7 @@ void watcherTask_(void* /*arg*/) {
             String frame;
             int budget = 32;                  // pro Conn max. 32 Frames je Runde
             while (budget-- > 0 && c.ws.poll(frame)) { c.lastRxMs = millis(); handleFrame_(c, frame); }
+            if (c.seedPending) { c.seedPending = false; seedFromNowPlaying_(c); }
             // Liveness: ein still verschwundener Speaker (kein FIN/RST) laesst
             // connected() ewig true -> sonst verpasst der Watcher JEDEN Press.
             // gabbo sendet im Normalbetrieb regelmaessig Frames; periodischer Ping
@@ -310,12 +554,13 @@ void watcherTask_(void* /*arg*/) {
             // -> close -> Reconnect ueber den !connected()-Pfad.
             if (millis() - c.lastPingMs > kPingMs) {
                 c.lastPingMs = millis();
-                if (!c.ws.ping()) { c.ws.close(); c.verifySlot = -1; continue; }
+                if (!c.ws.ping()) { c.ws.close(); c.verifySlot = -1; resetRescue_(c); continue; }
             }
             if (millis() - c.lastRxMs > kIdleMs) {
                 Serial.printf("[gabbo] %s idle -> reconnect\n", c.deviceId.c_str());
                 c.ws.close();
                 c.verifySlot = -1;   // Frames im Reconnect-Loch (z.B. STANDBY) waeren verpasst
+                resetRescue_(c);
                 continue;
             }
             // Timeout-Trigger: LIR-Slot selektiert, aber kein PLAY_STATE in der Frist.
@@ -340,6 +585,8 @@ void watcherTask_(void* /*arg*/) {
                     reArm_(c, slot, true);
                 }
             }
+            // Mid-Stream-Rescue: Abbruch erkannt und Burst ausgeklungen bzw. Rescue ohne PLAY_STATE.
+            if (c.rescueStage && (int32_t)(millis() - c.rescueDue) >= 0) rescueStep_(c);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }

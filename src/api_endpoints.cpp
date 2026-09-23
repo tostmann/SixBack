@@ -3195,7 +3195,17 @@ void handleGetHardwarePresets(AsyncWebServerRequest* req) {
         JsonObject o = slots.add<JsonObject>();
         o["slot"]     = s;
         o["source"]   = hw[s-1].source;
-        o["location"] = hw[s-1].location;
+        // LIR in unserer ORION-Form (so serviert account/full seit v0.8.50): der UI
+        // die Stream-URL liefern, die sie gegen store.streamUrl vergleicht und zum
+        // Abspielen nimmt — sonst gaelte jeder ORION-Slot pauschal als "synced".
+        String streamUrl, n, img;
+        if (hw[s-1].source == "LOCAL_INTERNET_RADIO" &&
+            sixback::orionStationDecode(hw[s-1].location, streamUrl, n, img)) {
+            o["location"] = streamUrl;
+            o["orion"]    = true;
+        } else {
+            o["location"] = hw[s-1].location;
+        }
         o["name"]     = hw[s-1].name;
         if (hw[s-1].source == "TUNEIN" && hw[s-1].location.startsWith("/v1/playback/station/")) {
             o["station_id"] = hw[s-1].location.substring(strlen("/v1/playback/station/"));

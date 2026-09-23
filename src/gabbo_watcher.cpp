@@ -24,6 +24,10 @@ constexpr uint32_t kReconcileMs       = 15000;   // Soll/Ist-Abgleich Inventory<
 constexpr uint32_t kReconnectMs       = 10000;   // pro Conn Reconnect-Throttle
 constexpr uint32_t kSuppressMs        = 20000;   // Self-Select-Echo-Fenster (doPush_ haengt bis 18s)
 constexpr uint32_t kPendingTimeoutMs  = 5000;    // Frist nach Selection: INVALID_SOURCE ODER kein PLAY_STATE -> Re-Arm
+// Puffert die Box nach dem Tastendruck, startet sie selbst (Preset in ORION-Form, seit v0.8.50):
+// laenger warten, statt ein /select mitten ins Puffern zu schicken. Beim Preset mit roher URL kam
+// vor dem Re-Arm nie BUFFERING (Test 2026-09-21), dort bleibt es bei kPendingTimeoutMs.
+constexpr uint32_t kPendingBufferingMs = 15000;
 constexpr uint8_t  kMaxAttempts       = 3;       // Re-Arm + bis zu 2 Nachfass-Versuche je Slot pro Cooldown
 constexpr uint32_t kAttemptCooldownMs = 60000;   // Cooldown fuer den Versuchs-Cap
 // Nachfassen (2026-09-21, Test auf SoundTouch 10 / FW 27.0.6): ein kalter LIR-Tastendruck aus
@@ -97,6 +101,7 @@ struct Conn {
     GabboWsClient  ws;
     int            pendingSlot = -1;          // Slot aus letztem nowSelectionUpdated
     uint32_t       pendingTs = 0;
+    bool           pendingBuffering = false;  // Box puffert seit dem Tastendruck -> kPendingBufferingMs
     int            verifySlot = -1;           // Slot, dessen Re-Arm noch kein PLAY_STATE gebracht hat
     uint32_t       verifyStartMs = 0;         // Zeitpunkt des letzten Re-Arm-/select
     uint32_t       verifyDeadline = 0;        // danach nachfassen
@@ -415,7 +420,7 @@ void handleFrame_(Conn& c, const String& f) {
             // weiterlaufen lassen — ein neuer Pending liefe ins Suppress-Fenster und bliebe stumm.
             if (slot == c.verifySlot) return;
             // Andere Taste ersetzt ein laufendes Nachfassen.
-            c.pendingSlot = slot; c.pendingTs = millis(); c.verifySlot = -1;
+            c.pendingSlot = slot; c.pendingTs = millis(); c.pendingBuffering = false; c.verifySlot = -1;
         }
         return;
     }
@@ -442,13 +447,20 @@ void handleFrame_(Conn& c, const String& f) {
             c.pendingSlot = -1; c.verifySlot = -1; return;
         }
     }
+    // Box puffert nach dem Tastendruck -> sie startet selbst; Re-Arm-Frist strecken.
+    if (c.pendingSlot >= 1 && f.indexOf("BUFFERING_STATE") >= 0) {
+        c.pendingBuffering = true;
+        return;
+    }
     // Box puffert nach unserem Re-Arm -> sie arbeitet; Frist einmalig bis kVerifyBufferingMs strecken.
     if (c.verifySlot >= 1 && f.indexOf("BUFFERING_STATE") >= 0) {
         c.verifyDeadline = c.verifyStartMs + kVerifyBufferingMs;
         return;
     }
     if (f.indexOf("INVALID_SOURCE") >= 0 || f.indexOf("<errorUpdate") >= 0) {
-        if (c.pendingSlot >= 1 && (millis() - c.pendingTs) < kPendingTimeoutMs) {
+        // pendingSlot >= 1 heisst: die Frist (5 s bzw. 15 s nach BUFFERING) laeuft noch — der
+        // Timeout-Zweig im Task raeumt sonst ab. Kein zweites, kuerzeres Gate hier.
+        if (c.pendingSlot >= 1) {
             int slot = c.pendingSlot;
             c.pendingSlot = -1;
             reArm_(c, slot, false);
@@ -568,7 +580,8 @@ void watcherTask_(void* /*arg*/) {
             // HTTP 200/Audio statt eines Station-Deskriptors -> der Speaker wirft KEIN
             // INVALID_SOURCE, steckt aber ohne playStatus fest. Das ist der REALE
             // #15-Fall (echte LIR-Streams sind live). On-device verifiziert 06-11.
-            if (c.pendingSlot >= 1 && (millis() - c.pendingTs) > kPendingTimeoutMs) {
+            if (c.pendingSlot >= 1 &&
+                (millis() - c.pendingTs) > (c.pendingBuffering ? kPendingBufferingMs : kPendingTimeoutMs)) {
                 int slot = c.pendingSlot;
                 c.pendingSlot = -1;
                 reArm_(c, slot, false);

@@ -92,12 +92,28 @@ NormalizeResult normalizePreset(const String& sourceStr,
         return r;
     }
     if (sourceStr == "LOCAL_INTERNET_RADIO" || sourceStr == "INTERNET_RADIO") {
-        // Ist die location bereits eine ORION-Adapter-Form (von SixBack selbst
-        // oder Bose-App/gmuth gepusht)? Dann laesst sich der echte streamUrl
-        // nicht verlustfrei rueckgewinnen -> 1:1 als OPAQUE durchreichen (der
-        // Caller kopiert das rohe <ContentItem>, toBoseXml bettet es wieder
-        // ein). Eine plain Stream-URL bleibt nativer LIR-Eintrag, den der Push
-        // ueber orionStationLocation() neu verpackt.
+        // Unsere eigene ORION-Form "/station?data=<base64-json>" (seit v0.8.50
+        // serviert account/full LIR-Presets so, der Speaker traegt sie also
+        // dauerhaft): streamUrl/name/imageUrl stehen im JSON -> zurueck zum
+        // nativen LIR-Eintrag. Als OPAQUE wuerde der Slot mit leerem
+        // sourceAccount aus account/full fallen und am Speaker geloescht.
+        if (location.startsWith("/station?data=")) {
+            String u, n, img;
+            if (orionStationDecode(location, u, n, img)) {
+                out.source    = PresetSource::LOCAL_INTERNET_RADIO;
+                out.streamUrl = u;
+                if (out.name.length() == 0)     out.name     = n;
+                if (out.imageUrl.length() == 0) out.imageUrl = img;
+                r.status      = NormalizeStatus::OK_PASSTHROUGH;
+                r.reason      = String("ORION ") + sourceStr + " → native LIR";
+                return r;
+            }
+        }
+        // Fremde ORION-Form (Bose-App/gmuth, voller Adapter-Pfad) oder nicht
+        // dekodierbar: echter streamUrl nicht verlustfrei rueckgewinnbar -> 1:1
+        // als OPAQUE durchreichen (der Caller kopiert das rohe <ContentItem>,
+        // toBoseXml bettet es wieder ein). Eine plain Stream-URL bleibt nativer
+        // LIR-Eintrag, den der Push ueber orionStationLocation() neu verpackt.
         if (location.startsWith("/station?data=") ||
             location.indexOf("svc-bmx-adapter-orion") >= 0) {
             out.source           = PresetSource::OPAQUE;

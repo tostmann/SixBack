@@ -350,7 +350,14 @@ static String buildDevicePresets_(const String& deviceId,
         if (p.source == sixback::PresetSource::TUNEIN) {
             out += "/v1/playback/station/"; out += xmlEsc_(p.stationId);
         } else {
-            out += xmlEsc_(p.streamUrl);
+            // LIR in ORION-Form, NICHT als rohe Stream-URL: ein Tastendruck auf ein
+            // Preset mit roher URL startet auf SoundTouch-FW 27.0.6 aus Standby nicht
+            // (Box haengt, nur der gabbo-Re-Arm rettet); mit ORION-Form startet er
+            // selbst (Test 2026-09-22: ST10 27.0.6 5/5, ST10 27.0.3 3/3, roh 0/8).
+            // Der Speaker pollt account/full ~21 s und traegt die Form dann dauerhaft
+            // (ein Long-Press-Save backt kurz die rohe URL, der naechste Poll
+            // korrigiert). Rueckwege dekodieren sie (normalizePreset, hardware-presets).
+            out += xmlEsc_(sixback::orionStationLocation(p.streamUrl, p.name, p.imageUrl));
         }
         out += "</location>";
         out += "<name>"; out += xmlEsc_(p.name); out += "</name>";

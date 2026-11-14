@@ -257,6 +257,14 @@ PYTHONPATH="$C5_ESPTOOL_PKG" "$HOME/.platformio/penv/bin/python" -m esptool --ch
 cp "$PIO_BUILD/c5-16mb-max/firmware.bin"  "$OUT/max/sixback-c5-16mb-max-firmware.bin"
 cp "$PIO_BUILD/c5-16mb-max/littlefs.bin"  "$OUT/max/sixback-c5-16mb-max-littlefs.bin"
 
+# --- 2b) esp-web-tools-Endblock-Guard ---------------------------------------
+# esp-web-tools 10.x bricht bei 99 % ab, wenn ein Part komprimiert auf einem
+# 1-Byte-Block endet — das Geraet bootet danach nicht. Factory-Images werden
+# dann mit 0xFF aufgefuellt, soweit ihre Partition es hergibt; sonst Abbruch
+# (Details: scripts/webflash_last_block.py, Gegenprobe aller Parts in 3e).
+python3 "$ROOT/scripts/webflash_last_block.py" --fix \
+  "$OUT"/sixback-*-factory.bin "$OUT"/max/sixback-*-factory.bin
+
 # --- 3) Manifeste schreiben — ausgelagert nach scripts/gen_manifests.sh ---
 # Der komplette Manifest-Inhalt steht dort und NUR dort: die "name"-Falle des
 # Update-Manifests (falscher Name => esp-web-tools erased das Geraet), die
@@ -299,6 +307,12 @@ for f in manifest.json manifest-update.json \
   fi
 done
 if [ "$manifest_missing" -gt 0 ]; then exit 2; fi
+
+# --- 3e) esp-web-tools-Endblock-Guard fuer jedes Part der Manifeste ---------
+# Jedes Part wird einzeln komprimiert. firmware/littlefs der Update-Manifeste
+# lassen sich nicht gefahrlos auffuellen — trifft es eines, hier abbrechen.
+python3 "$ROOT/scripts/webflash_last_block.py" --manifest \
+  "$OUT"/manifest*.json "$OUT"/max/manifest*.json
 
 # --- 4) Summary -----------------------------------------------------------
 echo

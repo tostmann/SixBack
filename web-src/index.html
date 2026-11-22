@@ -382,6 +382,14 @@
   .sb-urlform input { padding: .35em .55em; font-size: .9em; border: 1px solid var(--line);
                       border-radius: 6px; background: #fff; width: 100%; box-sizing: border-box; }
   .sb-grid-saved { flex: none; max-height: 13em; }
+  /* Spotify tab (#45): the add-URI form is a column flex container, so the
+     generic .sb-controls input rule (flex: 1 1 10em) made each input 10em TALL.
+     And the library grid (flex: 1; min-height: 0) shrank to zero height once
+     the content above it filled the panel — at 125 %/150 % display scaling no
+     tile was left to drag. Natural input height + a minimum grid height; the
+     panel scrolls instead. */
+  #splib-uri, #splib-name { flex: none; }
+  #splib-grid { min-height: 10em; }
 
   .lib-tile { border: 1px solid var(--line); border-radius: 6px; padding: .4em; background: #fff;
               cursor: grab; display: flex; flex-direction: column; gap: .25em;
